@@ -1,0 +1,63 @@
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Protocol
+
+from .canonical import canonical_url, source_key, stable_id
+from .models import SourceDocument, TranscriptSegment, VideoInput
+from .render import render_source
+
+
+class YouTubeClient(Protocol):
+    def list_playlist(self, playlist: str) -> list[VideoInput]: ...
+    def acknowledge(self, item: VideoInput) -> None: ...
+
+
+class TranscriptError(RuntimeError):
+    pass
+
+
+class FixtureYouTubeClient:
+    def __init__(self, fixture: Path):
+        self.fixture = fixture
+        self.acknowledged: list[str] = []
+
+    def list_playlist(self, playlist: str) -> list[VideoInput]:
+        data = json.loads(self.fixture.read_text(encoding="utf-8"))
+        items = data.get(playlist, data if isinstance(data, list) else [])
+        return [_video(item) for item in items]
+
+    def acknowledge(self, item: VideoInput) -> None:
+        self.acknowledged.append(item.playlist_item_id or item.video_id)
+
+
+def _segments(values: list[dict]) -> tuple[TranscriptSegment, ...]:
+    return tuple(TranscriptSegment(float(item["start"]), float(item.get("end", item["start"])), str(item["text"])) for item in values)
+
+
+def _video(item: dict) -> VideoInput:
+    return VideoInput(video_id=str(item["video_id"]), title=str(item.get("title", item["video_id"])), channel=item.get("channel"), published_at=item.get("published_at"), manual_transcript=_segments(item.get("manual_transcript", [])), automatic_transcript=_segments(item.get("automatic_transcript", [])), transcript_language=item.get("transcript_language"), playlist_item_id=item.get("playlist_item_id"))
+
+
+def _stamp(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+def render_video_source(video: VideoInput, captured_at: str, source_version: int = 1) -> SourceDocument:
+    segments = video.manual_transcript or video.automatic_transcript
+    if not segments:
+        raise TranscriptError("no manual or automatic transcript is available")
+    transcript_kind = "manual" if video.manual_transcript else "automatic"
+    body = "\n\n".join(f"### {_stamp(segment.start_seconds)}–{_stamp(segment.end_seconds)}\n{segment.text.strip()}" for segment in segments if segment.text.strip())
+    url = canonical_url(f"https://www.youtube.com/watch?v={video.video_id}")
+    source = render_source(source_id=stable_id("youtube", source_key("youtube", url)), kind="youtube", canonical_url=url, title=video.title, body=body, author=video.channel, publication_date=video.published_at, captured_at=captured_at, input_method=f"youtube-playlist:{transcript_kind}", source_version=source_version)
+    return source
+
+
+def youtube_citation(title: str, video_id: str, start_seconds: float, end_seconds: float) -> str:
+    return f"[{title} · {_stamp(start_seconds)}–{_stamp(end_seconds)}](https://www.youtube.com/watch?v={video_id}&t={int(start_seconds)}s)"

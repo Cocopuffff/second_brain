@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .batch import BatchError, BatchRunner
 from .config import Config
+from .git_ops import GitError, GitRepository
 from .state import StateStore
 from .synthesis import CodexHarnessSynthesizer, DeepSeekSynthesizer
 from .youtube import FixtureYouTubeClient
@@ -24,6 +25,27 @@ def _runner(config: Config) -> BatchRunner:
     else:
         synthesizer = None
     return BatchRunner(config, synthesizer=synthesizer)
+
+
+def _publication_statuses(config: Config, state: StateStore) -> list[dict]:
+    git = GitRepository(config.vault)
+    publications: list[dict] = []
+    try:
+        for journal in state.list_publications():
+            effective = dict(journal)
+            if journal["phase"] in {"publishing", "published_uncommitted"}:
+                commit_id = journal.get("commit_id") or git.find_batch_commit(journal["batch_id"])
+                if commit_id:
+                    entries = state.publication_entries(journal["batch_id"])
+                    paths = [entry["relative_path"] for entry in entries]
+                    hashes = {entry["relative_path"]: entry["candidate_hash"] for entry in entries}
+                    if git.verify_commit(commit_id, paths, hashes, journal["base_commit"]):
+                        effective["phase"] = "committed_unfinalized"
+                        effective["commit_id"] = commit_id
+            publications.append(effective)
+    except GitError as exc:
+        raise BatchError(str(exc)) from exc
+    return publications
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -63,7 +85,7 @@ def main(argv: list[str] | None = None) -> int:
             state = StateStore(config.database)
             try:
                 pending_cleanup = [job.id for job in state.pending_cleanup()]
-                print(json.dumps({"batches": state.list_batches(), "jobs": [job.__dict__ for job in state.list_jobs()], "publications": state.list_publications(), "pending_cleanup": pending_cleanup, "outstanding_cleanup": len(pending_cleanup)}, ensure_ascii=False))
+                print(json.dumps({"batches": state.list_batches(), "jobs": [job.__dict__ for job in state.list_jobs()], "publications": _publication_statuses(config, state), "pending_cleanup": pending_cleanup, "outstanding_cleanup": len(pending_cleanup)}, ensure_ascii=False))
             finally:
                 state.close()
             return 0

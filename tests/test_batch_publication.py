@@ -43,6 +43,15 @@ class CrashAt:
             raise PublicationCrash(event)
 
 
+class ErrorAt:
+    def __init__(self, event: str):
+        self.event = event
+
+    def hit(self, event: str, **_details):
+        if event == self.event:
+            raise RuntimeError(f"handled fault at {event}")
+
+
 def test_successful_publication_reports_complete_and_one_batch_commit(tmp_path: Path, capsys):
     vault, config = _vault(tmp_path)
     report = BatchRunner(config, fetcher=lambda _: "<article><p>Evidence.</p></article>").run()
@@ -72,6 +81,18 @@ def test_crash_during_publication_is_rolled_back_on_next_run(tmp_path: Path):
 
     assert not report.committed
     assert report.publication_phase == "rolled_back"
+    assert _commits(vault) == 1
+    assert (vault / "To Ingest.md").read_text(encoding="utf-8") == "https://example.com/article\n"
+    assert not list((vault / "Sources").rglob("*.md"))
+
+
+def test_handled_publication_failure_reconciles_before_returning(tmp_path: Path):
+    vault, config = _vault(tmp_path)
+
+    report = BatchRunner(config, fetcher=lambda _: "<article><p>Evidence.</p></article>", _publication_faults=ErrorAt("file_published")).run()
+
+    assert report.publication_phase in {"rolled_back", "recovery_blocked"}
+    assert report.publication_phase != "publishing"
     assert _commits(vault) == 1
     assert (vault / "To Ingest.md").read_text(encoding="utf-8") == "https://example.com/article\n"
     assert not list((vault / "Sources").rglob("*.md"))
@@ -113,6 +134,19 @@ def test_crash_after_git_commit_adopts_existing_commit(tmp_path: Path):
     assert report.publication_phase == "complete"
     assert _commits(vault) == 2
     assert len(list((vault / "Sources").rglob("*.md"))) == 1
+
+
+def test_status_recognizes_committed_but_unfinalized_publication(tmp_path: Path, capsys):
+    vault, config = _vault(tmp_path)
+    with pytest.raises(PublicationCrash):
+        BatchRunner(config, fetcher=lambda _: "<article><p>Evidence.</p></article>", _publication_faults=CrashAt("git_commit")).run()
+
+    assert main(["--vault", str(vault), "--state-dir", str(config.state_dir), "status"]) == 0
+    status = json.loads(capsys.readouterr().out)
+    publication = status["publications"][0]
+    assert publication["phase"] == "committed_unfinalized"
+    assert publication["commit_id"] == subprocess.run(["git", "rev-parse", "HEAD"], cwd=vault, text=True, capture_output=True, check=True).stdout.strip()
+    assert _commits(vault) == 2
 
 
 def test_untracked_generated_input_is_a_stop_condition(tmp_path: Path):
@@ -203,7 +237,7 @@ def test_deletion_is_committed_and_rollback_restores_deleted_file(tmp_path: Path
     assert (vault / "Concepts/old.md").read_text(encoding="utf-8") == "old\n"
 
 
-def test_source_deletion_is_allowed_and_recoverable(tmp_path: Path):
+def test_source_deletion_requested_by_synthesis_is_rejected(tmp_path: Path):
     vault, config = _vault(tmp_path)
     (vault / "Sources/Articles").mkdir(parents=True)
     old_source = vault / "Sources/Articles/old.md"
@@ -217,8 +251,9 @@ def test_source_deletion_is_allowed_and_recoverable(tmp_path: Path):
 
     report = BatchRunner(config, synthesizer=DeleteSource(), fetcher=lambda _: "<article><p>Evidence.</p></article>").run()
 
-    assert report.committed
-    assert not old_source.exists()
+    assert not report.committed
+    assert old_source.read_text(encoding="utf-8") == "old source\n"
+    assert _commits(vault) == 2
 
 
 @pytest.mark.parametrize("event", ["raw_payload_removed", "cleanup_marked"])
@@ -264,3 +299,48 @@ def test_cleanup_does_not_delete_payload_without_a_fingerprint(tmp_path: Path):
         state.close()
     assert publication["phase"] == "cleanup_pending"
     assert publication["failure_code"] == "cleanup_payload_unverified"
+
+
+def test_cleanup_recovery_is_reported_by_batch_run(tmp_path: Path):
+    vault, config = _vault(tmp_path, queue="")
+    to_ingest = vault / "ToIngest"
+    to_ingest.mkdir()
+    raw = to_ingest / "saved.html"
+    raw.write_text('<html><head><link rel="canonical" href="https://example.com/saved"></head><body><article><p>Saved evidence.</p></article></body></html>', encoding="utf-8")
+
+    with pytest.raises(PublicationCrash):
+        BatchRunner(config, fetcher=lambda _: "bad", _publication_faults=CrashAt("sqlite_finalized")).run()
+    raw.write_text(raw.read_text(encoding="utf-8") + "changed", encoding="utf-8")
+
+    report = BatchRunner(config).run()
+
+    assert report.publication_phase == "cleanup_pending"
+    assert report.recovery_action == "cleanup_pending"
+    assert report.publication_failure_code == "cleanup_payload_changed"
+    assert report.outstanding_cleanup == 1
+
+
+def test_rebound_cleanup_stays_attached_to_original_publication(tmp_path: Path, capsys):
+    vault, config = _vault(tmp_path, queue="")
+    to_ingest = vault / "ToIngest"
+    to_ingest.mkdir()
+    raw = to_ingest / "saved.html"
+    raw.write_text('<html><head><link rel="canonical" href="https://example.com/saved"></head><body><article><p>Saved evidence.</p></article></body></html>', encoding="utf-8")
+
+    with pytest.raises(PublicationCrash):
+        BatchRunner(config, fetcher=lambda _: "bad", _publication_faults=CrashAt("sqlite_finalized")).run()
+
+    raw.write_text(raw.read_text(encoding="utf-8") + "changed", encoding="utf-8")
+    (vault / "To Ingest.md").write_text("https://example.com/saved\n", encoding="utf-8")
+
+    BatchRunner(config).run()
+    BatchRunner(config).run()
+
+    assert _commits(vault) == 2
+    assert raw.exists()
+    assert main(["--vault", str(vault), "--state-dir", str(config.state_dir), "status"]) == 0
+    status = json.loads(capsys.readouterr().out)
+    saved_job = next(job for job in status["jobs"] if job["original_locator"] == "https://example.com/saved")
+    publication = next(publication for publication in status["publications"] if publication["phase"] == "cleanup_pending")
+    assert saved_job["cleanup_pending"] is True
+    assert publication["phase"] == "cleanup_pending"

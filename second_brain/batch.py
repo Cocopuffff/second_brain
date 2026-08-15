@@ -85,9 +85,11 @@ class BatchRunner:
         git = GitRepository(self.config.vault)
         publication = BatchPublication(self.config, state, git, faults=self._publication_faults)
         recovery = publication.recover_oldest()
-        publication.retry_cleanup()
         if recovery:
             return self._publication_report(recovery, state)
+        cleanup_recovery = publication.retry_cleanup()
+        if cleanup_recovery:
+            return self._publication_report(cleanup_recovery, state)
 
         # Queue and raw HTML are accepted inputs; every other existing staged,
         # modified, or untracked path is an operator-owned stop condition.
@@ -212,6 +214,9 @@ class BatchRunner:
             journal = state.publication(batch_id)
             failures.append(str(exc))
             if journal:
+                recovery = publication.recover_oldest()
+                if recovery:
+                    return self._publication_report(recovery, state, claimed=claimed_count, completed=len(sources), failed=len(failures), failures=tuple(failures))
                 state.update_publication(batch_id, journal["phase"], action="publication_failed", failure_code=exc.code, failure_message=exc.message)
                 phase = journal["phase"]
             else:
@@ -221,6 +226,10 @@ class BatchRunner:
         except Exception as exc:
             journal = state.publication(batch_id)
             if journal:
+                recovery = publication.recover_oldest()
+                if recovery:
+                    failures.append(str(exc))
+                    return self._publication_report(recovery, state, claimed=claimed_count, completed=len(sources), failed=len(failures), failures=tuple(failures))
                 state.update_publication(batch_id, journal["phase"], action="publication_failed", failure_code="publication_failed", failure_message=str(exc))
             else:
                 state.fail_batch(batch_id)

@@ -49,8 +49,8 @@ def validate_changes(changes: ChangeSet, sources: list[SourceDocument], vault: P
         if deletion in seen_paths or deletion.casefold() in {value.casefold() for value in seen_paths}:
             raise ValidationError(f"duplicate executor path: {deletion}")
         seen_paths.add(deletion)
-        if path.is_absolute() or ".." in path.parts or not (str(path).startswith("Concepts/") or str(path).startswith("Sources/")):
-            raise ValidationError(f"executor deletion escapes the validated vault scopes: {deletion}")
+        if path.is_absolute() or ".." in path.parts or not str(path).startswith("Concepts/"):
+            raise ValidationError(f"executor deletion is restricted to Concepts/: {deletion}")
     for source in sources:
         rendered = render_markdown(source)
         validate_markdown(rendered, source=source)

@@ -140,13 +140,22 @@ class BatchPublication:
         self._fault("commit_journaled", batch_id=batch_id, commit_id=commit_id)
         return self._finalize_existing(self.state.publication(batch_id) or {}, commit_id, "published_and_committed")
 
-    def retry_cleanup(self) -> int:
-        cleaned = 0
+    def retry_cleanup(self) -> PublicationResult | None:
+        result: PublicationResult | None = None
         for journal in self.state.list_publications():
             if journal["phase"] not in {"finalized", "cleanup_pending"}:
                 continue
-            cleaned += self._cleanup_journal(journal)
-        return cleaned
+            self._cleanup_journal(journal)
+            current = self.state.publication(journal["batch_id"]) or journal
+            result = PublicationResult(
+                journal["batch_id"],
+                current["phase"],
+                current.get("recovery_action"),
+                current.get("commit_id"),
+                current.get("failure_code"),
+                current.get("failure_message"),
+            )
+        return result
 
     def _finalize_existing(self, journal: dict, commit_id: str, action: str) -> PublicationResult:
         batch_id = journal["batch_id"]
@@ -200,7 +209,13 @@ class BatchPublication:
                 self.state.update_publication(batch_id, "cleanup_pending", action="cleanup_pending", failure_code=exc.code, failure_message=exc.message)
             except OSError as exc:
                 self.state.update_publication(batch_id, "cleanup_pending", action="cleanup_pending", failure_code="cleanup_failed", failure_message=str(exc))
-        remaining = [job for job in self.state.jobs_for_batch(batch_id) if job.cleanup_pending]
+        remaining = [
+            item
+            for item in jobs
+            if item["role"] == "source"
+            and (job := self.state.get(item["job_id"])) is not None
+            and job.cleanup_pending
+        ]
         if not remaining:
             self.state.mark_publication_complete(batch_id)
             self._compact(batch_id)

@@ -50,6 +50,14 @@ class Config:
         errors: list[str] = []
         if not self.vault.exists():
             errors.append(f"vault does not exist: {self.vault}")
+        try:
+            self.state_dir.relative_to(self.vault)
+        except ValueError:
+            pass
+        else:
+            errors.append("state directory must remain outside the vault")
+        if self.vault.exists() and not (self.vault / ".git").exists():
+            errors.append(f"vault is not a local Git worktree: {self.vault}")
         if not (self.vault / "To Ingest.md").exists() and not (self.to_ingest / "To Ingest.md").exists():
             errors.append("missing To Ingest.md or ToIngest/To Ingest.md")
         if self.executor not in {"noop", "deepseek", "codex"}:

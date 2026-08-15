@@ -9,6 +9,20 @@ from typing import Iterator
 from .models import Job, utc_now
 
 
+PUBLICATION_PHASES = frozenset({
+    "candidate_validated",
+    "rollback_snapshot_recorded",
+    "publishing",
+    "published_uncommitted",
+    "committed_unfinalized",
+    "finalized",
+    "cleanup_pending",
+    "complete",
+    "rolled_back",
+    "recovery_blocked",
+})
+
+
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS batches (
@@ -41,6 +55,41 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS jobs_batch_idx ON jobs(batch_id);
 CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status);
+CREATE TABLE IF NOT EXISTS publication_journals (
+  batch_id TEXT PRIMARY KEY REFERENCES batches(id),
+  phase TEXT NOT NULL,
+  candidate_workspace TEXT NOT NULL,
+  candidate_manifest_hash TEXT NOT NULL,
+  snapshot_workspace TEXT,
+  snapshot_manifest_hash TEXT,
+  base_commit TEXT NOT NULL,
+  commit_id TEXT,
+  blocked_from_phase TEXT,
+  recovery_action TEXT,
+  failure_code TEXT,
+  failure_message TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS publication_entries (
+  batch_id TEXT NOT NULL REFERENCES publication_journals(batch_id),
+  ordinal INTEGER NOT NULL,
+  relative_path TEXT NOT NULL,
+  operation TEXT NOT NULL CHECK (operation IN ('write', 'delete')),
+  candidate_hash TEXT,
+  PRIMARY KEY (batch_id, ordinal),
+  UNIQUE (batch_id, relative_path)
+);
+CREATE TABLE IF NOT EXISTS publication_jobs (
+  batch_id TEXT NOT NULL REFERENCES publication_journals(batch_id),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  role TEXT NOT NULL CHECK (role IN ('source', 'queue_ack')),
+  expected_content_hash TEXT,
+  raw_path TEXT,
+  raw_hash TEXT,
+  PRIMARY KEY (batch_id, job_id, role)
+);
+CREATE INDEX IF NOT EXISTS publication_phase_idx ON publication_journals(phase, created_at);
 """
 
 
@@ -73,6 +122,78 @@ class StateStore:
             db.execute("INSERT INTO batches VALUES (?, 'running', ?, ?, NULL)", (batch_id, now, now))
         return batch_id
 
+    def write_publication_journal(self, batch_id: str, *, phase: str, candidate_workspace: str, candidate_manifest_hash: str, base_commit: str, entries: list[dict], jobs: list[dict]) -> None:
+        now = utc_now()
+        with self.transaction() as db:
+            db.execute("""INSERT INTO publication_journals
+                (batch_id, phase, candidate_workspace, candidate_manifest_hash, base_commit, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""", (batch_id, phase, candidate_workspace, candidate_manifest_hash, base_commit, now, now))
+            db.executemany("""INSERT INTO publication_entries
+                (batch_id, ordinal, relative_path, operation, candidate_hash)
+                VALUES (?, ?, ?, ?, ?)""", [(batch_id, index, entry["path"], entry["operation"], entry.get("candidate_hash")) for index, entry in enumerate(entries)])
+            db.executemany("""INSERT INTO publication_jobs
+                (batch_id, job_id, role, expected_content_hash, raw_path, raw_hash)
+                VALUES (?, ?, ?, ?, ?, ?)""", [(batch_id, item["job_id"], item["role"], item.get("expected_content_hash"), item.get("raw_path"), item.get("raw_hash")) for item in jobs])
+
+    def publication(self, batch_id: str) -> dict | None:
+        row = self.connection.execute("SELECT * FROM publication_journals WHERE batch_id=?", (batch_id,)).fetchone()
+        return dict(row) if row else None
+
+    def publication_entries(self, batch_id: str) -> list[dict]:
+        return [dict(row) for row in self.connection.execute("SELECT * FROM publication_entries WHERE batch_id=? ORDER BY ordinal", (batch_id,))]
+
+    def publication_jobs(self, batch_id: str) -> list[dict]:
+        return [dict(row) for row in self.connection.execute("SELECT * FROM publication_jobs WHERE batch_id=? ORDER BY job_id", (batch_id,))]
+
+    def oldest_unresolved_publication(self) -> dict | None:
+        row = self.connection.execute("""SELECT * FROM publication_journals
+            WHERE phase IN ('candidate_validated', 'rollback_snapshot_recorded', 'publishing', 'published_uncommitted', 'committed_unfinalized', 'recovery_blocked')
+            ORDER BY created_at, batch_id LIMIT 1""").fetchone()
+        return dict(row) if row else None
+
+    def list_publications(self) -> list[dict]:
+        return [dict(row) for row in self.connection.execute("SELECT * FROM publication_journals ORDER BY created_at DESC, batch_id DESC")]
+
+    def update_publication(self, batch_id: str, phase: str, *, action: str | None = None, commit_id: str | None = None, failure_code: str | None = None, failure_message: str | None = None, blocked_from_phase: str | None = None) -> None:
+        if phase not in PUBLICATION_PHASES:
+            raise ValueError(f"unknown publication phase: {phase}")
+        with self.transaction() as db:
+            current = db.execute("SELECT phase FROM publication_journals WHERE batch_id=?", (batch_id,)).fetchone()
+            if not current:
+                raise KeyError(batch_id)
+            db.execute("""UPDATE publication_journals
+                SET phase=?, recovery_action=COALESCE(?, recovery_action), commit_id=COALESCE(?, commit_id),
+                    failure_code=?, failure_message=?, blocked_from_phase=COALESCE(?, blocked_from_phase), updated_at=?
+                WHERE batch_id=?""", (phase, action, commit_id, failure_code, failure_message, blocked_from_phase, utc_now(), batch_id))
+
+    def record_snapshot(self, batch_id: str, workspace: str, manifest_hash: str) -> None:
+        with self.transaction() as db:
+            db.execute("UPDATE publication_journals SET snapshot_workspace=?, snapshot_manifest_hash=?, updated_at=? WHERE batch_id=?", (workspace, manifest_hash, utc_now(), batch_id))
+
+    def finalize_publication(self, batch_id: str, commit_id: str) -> None:
+        now = utc_now()
+        with self.transaction() as db:
+            journal = db.execute("SELECT * FROM publication_journals WHERE batch_id=?", (batch_id,)).fetchone()
+            if not journal:
+                raise KeyError(batch_id)
+            for row in db.execute("SELECT * FROM publication_jobs WHERE batch_id=? AND role='source'", (batch_id,)):
+                job = db.execute("SELECT * FROM jobs WHERE id=?", (row["job_id"],)).fetchone()
+                if not job or job["batch_id"] != batch_id or job["status"] not in {"source_ready", "complete"} or job["content_hash"] != row["expected_content_hash"]:
+                    raise ValueError(f"journaled source job {row['job_id']} no longer matches the publication")
+                db.execute("UPDATE jobs SET status='complete', commit_id=?, updated_at=? WHERE id=?", (commit_id, now, row["job_id"]))
+            db.execute("""UPDATE jobs SET queue_acknowledged=1, updated_at=?
+                WHERE id IN (SELECT job_id FROM publication_jobs WHERE batch_id=? AND role='queue_ack')""", (now, batch_id))
+            db.execute("UPDATE batches SET status='complete', commit_id=?, updated_at=? WHERE id=?", (commit_id, now, batch_id))
+            db.execute("""UPDATE publication_journals SET phase='finalized', commit_id=?, recovery_action='finalized', failure_code=NULL, failure_message=NULL, updated_at=? WHERE batch_id=?""", (commit_id, now, batch_id))
+
+    def mark_publication_cleanup_pending(self, batch_id: str) -> None:
+        with self.transaction() as db:
+            db.execute("UPDATE publication_journals SET phase='cleanup_pending', updated_at=? WHERE batch_id=? AND phase='finalized'", (utc_now(), batch_id))
+
+    def mark_publication_complete(self, batch_id: str) -> None:
+        with self.transaction() as db:
+            db.execute("UPDATE publication_journals SET phase='complete', recovery_action='complete', updated_at=? WHERE batch_id=? AND phase IN ('finalized', 'cleanup_pending')", (utc_now(), batch_id))
+
     def recover(self) -> None:
         now = utc_now()
         with self.transaction() as db:
@@ -85,6 +206,7 @@ class StateStore:
             row = db.execute("SELECT * FROM jobs WHERE source_key=?", (source_key,)).fetchone()
             if row:
                 db.execute("UPDATE jobs SET batch_id=?, input_artifact=COALESCE(?, input_artifact), updated_at=? WHERE id=?", (batch_id, input_artifact, now, row["id"]))
+                row = db.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
             else:
                 job_id = uuid.uuid4().hex
                 db.execute("""INSERT INTO jobs (id, kind, source_key, original_locator, input_artifact, batch_id, status, captured_at, created_at, updated_at)
@@ -113,9 +235,9 @@ class StateStore:
             db.execute("UPDATE jobs SET status='failed', retryable=?, failure_code=?, failure_message=?, updated_at=? WHERE id=?", (int(retryable), code, message, utc_now(), job_id))
 
     def finalize(self, batch_id: str, commit_id: str) -> None:
-        with self.transaction() as db:
-            db.execute("UPDATE jobs SET status='complete', commit_id=?, updated_at=? WHERE batch_id=? AND status='source_ready'", (commit_id, utc_now(), batch_id))
-            db.execute("UPDATE batches SET status='complete', commit_id=?, updated_at=? WHERE id=?", (commit_id, utc_now(), batch_id))
+        if not self.publication(batch_id):
+            raise ValueError(f"batch {batch_id} has no publication journal")
+        self.finalize_publication(batch_id, commit_id)
 
     def fail_batch(self, batch_id: str) -> None:
         with self.transaction() as db:

@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 import fcntl
-import os
-import shutil
-import tempfile
 import urllib.request
 from collections import defaultdict
 from contextlib import contextmanager
@@ -15,7 +12,8 @@ from .extraction import ImageProcessor, extract_article
 from .git_ops import GitError, GitRepository
 from .html_discovery import discover_html, html_hash
 from .models import BatchReport, ChangeSet, SourceDocument, utc_now
-from .queue import claim_article_queue
+from .publication import BatchPublication, PublicationCrash, PublicationError, PublicationFaults
+from .queue import claim_article_queue, remove_claimed_urls_text
 from .render import render_markdown, render_source
 from .state import StateStore
 from .synthesis import NoopSynthesizer, Synthesizer
@@ -42,12 +40,13 @@ def single_process_lock(path: Path):
 
 
 class BatchRunner:
-    def __init__(self, config: Config, *, synthesizer: Synthesizer | None = None, image_processor: ImageProcessor | None = None, youtube_client: YouTubeClient | None = None, fetcher=None):
+    def __init__(self, config: Config, *, synthesizer: Synthesizer | None = None, image_processor: ImageProcessor | None = None, youtube_client: YouTubeClient | None = None, fetcher=None, _publication_faults: PublicationFaults | None = None):
         self.config = config
         self.synthesizer = synthesizer or NoopSynthesizer()
         self.image_processor = image_processor
         self.youtube_client = youtube_client
         self.fetcher = fetcher or self._fetch
+        self._publication_faults = _publication_faults
 
     def initialize(self) -> None:
         self.config.to_ingest.mkdir(parents=True, exist_ok=True)
@@ -83,9 +82,16 @@ class BatchRunner:
             state.close()
 
     def _run_locked(self, state: StateStore, retry_job_id: str | None = None) -> BatchReport:
-        # This is the pre-consumption cleanliness checkpoint. Queue acknowledgement
-        # and source publication below are this batch's own explicit changes.
-        GitRepository(self.config.vault).ensure_clean(allowed_paths={str(self._queue_path().relative_to(self.config.vault))}, allowed_prefixes=("ToIngest/",))
+        git = GitRepository(self.config.vault)
+        publication = BatchPublication(self.config, state, git, faults=self._publication_faults)
+        recovery = publication.recover_oldest()
+        publication.retry_cleanup()
+        if recovery:
+            return self._publication_report(recovery, state)
+
+        # Queue and raw HTML are accepted inputs; every other existing staged,
+        # modified, or untracked path is an operator-owned stop condition.
+        git.ensure_clean(allowed_paths=self._allowed_input_paths())
         state.recover()
         batch_id = state.create_batch()
         claimed_count = 0
@@ -105,21 +111,24 @@ class BatchRunner:
         for path, url, _title in html_files:
             html_by_key[source_key("article", url)].append(path)
 
-        queue_inputs, queue_errors = claim_article_queue(self._queue_path(), state, batch_id)
+        queue_path = self._queue_path()
+        queue_inputs, queue_errors = claim_article_queue(queue_path, state, batch_id, acknowledge=False)
+        queue_job_ids: list[str] = []
         failures.extend(queue_errors)
         for item in queue_inputs:
             key = source_key("article", item.url)
+            job = state.find(key)
+            if job:
+                queue_job_ids.append(job.id)
             paths = html_by_key.get(key, [])
             if paths:
                 hashes = {html_hash(path) for path in paths}
                 if len(hashes) > 1:
-                    job = state.find(key)
                     if job:
                         state.fail(job.id, "conflicting_html", "multiple non-identical HTML files claim the same canonical URL")
                     failures.append(f"{item.url}: conflicting HTML payloads")
                 else:
-                    state.attach_artifact(state.find(key).id, str(paths[0]))  # type: ignore[union-attr]
-            state.acknowledge(state.find(key).id)  # type: ignore[union-attr]
+                    state.attach_artifact(job.id, str(paths[0]))  # type: ignore[union-attr]
         claimed_count += len(queue_inputs)
 
         for key, paths in html_by_key.items():
@@ -134,6 +143,13 @@ class BatchRunner:
                 claimed_count += 1
             else:
                 state.attach_artifact(job.id, str(paths[0]))
+
+        raw_fingerprints: dict[str, tuple[str, str | None]] = {}
+        for job in state.jobs_for_batch(batch_id):
+            if not job.input_artifact:
+                continue
+            artifact = Path(job.input_artifact)
+            raw_fingerprints[job.id] = (str(artifact), html_hash(artifact) if artifact.exists() and artifact.is_file() else None)
 
         if self.youtube_client:
             for video in self.youtube_client.list_playlist(self.config.youtube_playlist):
@@ -160,7 +176,7 @@ class BatchRunner:
                         raise BatchError("YouTube video is not available from the configured client")
                     source = render_video_source(video, job.captured_at or utc_now(), job.source_version or 1)
                 state.complete(job.id, source.content_hash, source.source_version, cleanup_pending=bool(job.input_artifact and job.kind == "article"))
-                source_jobs.append((job, source))
+                source_jobs.append((state.get(job.id), source))  # type: ignore[arg-type]
                 sources.append(source)
             except Exception as exc:
                 code = "transcript_missing" if "transcript" in str(exc).lower() else "processing_failed"
@@ -180,25 +196,45 @@ class BatchRunner:
             for relative_path, content in source_files.items():
                 validate_markdown(content)
             all_files = {**source_files, **{candidate.relative_path: candidate.content for candidate in changes.files}}
+            if queue_inputs and queue_path.exists():
+                latest_queue = queue_path.read_text(encoding="utf-8")
+                claimed_urls = {item.url for item in queue_inputs}
+                all_files[str(queue_path.relative_to(self.config.vault))] = remove_claimed_urls_text(latest_queue, claimed_urls)
             if not all_files and not changes.deletions:
                 state.fail_batch(batch_id)
                 return BatchReport(batch_id=batch_id, claimed=claimed_count, completed=0, failed=len(failures), committed=False, commit_id=None, failures=tuple(failures))
-            GitRepository(self.config.vault).ensure_clean(allowed_paths={str(self._queue_path().relative_to(self.config.vault))}, allowed_prefixes=("ToIngest/",))
-            self._publish_candidates(all_files, changes.deletions)
-            git = GitRepository(self.config.vault)
-            batch_paths = set(all_files) | set(changes.deletions)
-            if queue_inputs:
-                batch_paths.add(str(self._queue_path().relative_to(self.config.vault)))
-            paths = sorted(batch_paths)
-            commit_id = git.commit_paths(paths, f"ingest: batch {batch_id} ({len(sources)} complete, {len(failures)} failed)")
-            state.finalize(batch_id, commit_id)
-            self._cleanup_sources(state, source_jobs)
-            return BatchReport(batch_id=batch_id, claimed=claimed_count, completed=len(sources), failed=len(failures), committed=True, commit_id=commit_id, failures=tuple(failures))
+            git.ensure_clean(allowed_paths=self._allowed_input_paths())
+            result = publication.publish(batch_id, all_files, changes.deletions, queue_path=str(queue_path.relative_to(self.config.vault)), queue_job_ids=queue_job_ids, source_jobs=[job for job, _source in source_jobs], raw_fingerprints=raw_fingerprints)
+            return self._publication_report(result, state, claimed=claimed_count, completed=len(sources), failed=len(failures), failures=tuple(failures))
+        except PublicationCrash:
+            raise
+        except PublicationError as exc:
+            journal = state.publication(batch_id)
+            failures.append(str(exc))
+            if journal:
+                state.update_publication(batch_id, journal["phase"], action="publication_failed", failure_code=exc.code, failure_message=exc.message)
+                phase = journal["phase"]
+            else:
+                state.fail_batch(batch_id)
+                phase = "rolled_back"
+            return BatchReport(batch_id=batch_id, claimed=claimed_count, completed=0, failed=len(failures), committed=False, commit_id=journal.get("commit_id") if journal else None, failures=tuple(failures), publication_phase=phase, recovery_action="publication_failed", publication_failure_code=exc.code, publication_failure_message=exc.message, outstanding_cleanup=len(state.pending_cleanup()))
         except Exception as exc:
-            state.fail_batch(batch_id)
+            journal = state.publication(batch_id)
+            if journal:
+                state.update_publication(batch_id, journal["phase"], action="publication_failed", failure_code="publication_failed", failure_message=str(exc))
+            else:
+                state.fail_batch(batch_id)
             if not isinstance(exc, ValidationError):
                 failures.append(str(exc))
-            return BatchReport(batch_id=batch_id, claimed=claimed_count, completed=0, failed=len(failures), committed=False, commit_id=None, failures=tuple(failures))
+            return BatchReport(batch_id=batch_id, claimed=claimed_count, completed=0, failed=len(failures), committed=False, commit_id=journal.get("commit_id") if journal else None, failures=tuple(failures), publication_phase=journal["phase"] if journal else None, recovery_action="publication_failed" if journal else None, publication_failure_code="publication_failed" if journal else None, publication_failure_message=str(exc) if journal else None, outstanding_cleanup=len(state.pending_cleanup()))
+
+    @staticmethod
+    def _publication_report(result, state: StateStore, *, claimed: int = 0, completed: int | None = None, failed: int | None = None, failures: tuple[str, ...] = ()) -> BatchReport:
+        jobs = state.jobs_for_batch(result.batch_id)
+        completed = sum(job.status == "complete" for job in jobs) if completed is None else completed
+        failed = sum(job.status == "failed" for job in jobs) if failed is None else failed
+        failures = tuple(job.failure_message for job in jobs if job.failure_message) if not failures else failures
+        return BatchReport(batch_id=result.batch_id, claimed=claimed, completed=completed, failed=failed, committed=result.phase in {"finalized", "cleanup_pending", "complete"}, commit_id=result.commit_id, failures=failures, publication_phase=result.phase, recovery_action=result.action, recovery_block_reason=(result.failure_code or result.failure_message) if result.phase == "recovery_blocked" else None, publication_failure_code=result.failure_code, publication_failure_message=result.failure_message, outstanding_cleanup=len(state.pending_cleanup()))
 
     def _article_source(self, job) -> SourceDocument:
         if job is None:
@@ -213,31 +249,6 @@ class BatchRunner:
         source_id = stable_id("article", job.source_key)
         return render_source(source_id=source_id, kind="article", canonical_url=job.original_locator, title=extracted["title"], body=extracted["body"], author=None, publication_date=None, captured_at=job.captured_at or utc_now(), input_method=input_method, source_version=job.source_version or 1)
 
-    def _publish_candidates(self, files: dict[str, str], deletions: tuple[str, ...]) -> None:
-        for relative_path, content in files.items():
-            target = (self.config.vault / relative_path).resolve()
-            target.relative_to(self.config.vault.resolve())
-            target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_name(f".{target.name}.candidate")
-            temporary.write_text(content, encoding="utf-8", newline="\n")
-            os.replace(temporary, target)
-        for relative_path in deletions:
-            target = self.config.vault / relative_path
-            if target.exists():
-                target.unlink()
-
-    def _cleanup_sources(self, state: StateStore, source_jobs: list[tuple[object, SourceDocument]]) -> None:
-        for job, _source in source_jobs:
-            if job.input_artifact:
-                path = Path(job.input_artifact)
-                try:
-                    path.resolve().relative_to(self.config.to_ingest.resolve())
-                except ValueError:
-                    continue
-                if path.exists():
-                    path.unlink()
-                state.mark_cleanup_done(job.id)
-
     def _concept_catalog(self) -> dict[str, str]:
         result: dict[str, str] = {}
         if not self.config.concepts.exists():
@@ -249,6 +260,15 @@ class BatchRunner:
     def _queue_path(self) -> Path:
         nested = self.config.to_ingest / "To Ingest.md"
         return nested if nested.exists() else self.config.vault / "To Ingest.md"
+
+    def _allowed_input_paths(self) -> set[str]:
+        allowed = {str(self._queue_path().relative_to(self.config.vault))}
+        pairing = self.config.to_ingest / "HTML Pairings.yaml"
+        if pairing.exists():
+            allowed.add(str(pairing.relative_to(self.config.vault)))
+        if self.config.to_ingest.exists():
+            allowed.update(str(path.relative_to(self.config.vault)) for path in self.config.to_ingest.iterdir() if path.is_file() and path.suffix.lower() in {".html", ".htm"})
+        return allowed
 
     @staticmethod
     def _fetch(url: str) -> str:

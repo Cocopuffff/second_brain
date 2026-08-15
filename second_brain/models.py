@@ -95,3 +95,9 @@ class BatchReport:
     committed: bool
     commit_id: str | None
     failures: tuple[str, ...] = ()
+    publication_phase: str | None = None
+    recovery_action: str | None = None
+    recovery_block_reason: str | None = None
+    publication_failure_code: str | None = None
+    publication_failure_message: str | None = None
+    outstanding_cleanup: int = 0

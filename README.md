@@ -29,6 +29,8 @@ Install and enable the Obsidian Advanced URI community plugin yourself. Article 
 
 ## Recovery and operations
 
-The SQLite lifecycle records claims, attempts, failures, acknowledgements, source hashes, cleanup, and Git commit IDs. Re-running a batch recovers jobs left in `processing`. Raw HTML is removed only after the corresponding source is included in a confirmed commit. Failed synthesis leaves candidate work and raw HTML uncommitted. Re-submit a failed job through a small adapter/CLI extension or delete only its failed state in a deliberate maintenance operation; do not edit the vault source evidence.
+The SQLite lifecycle records claims, attempts, failures, acknowledgements, source hashes, cleanup, and Git commit IDs. Each non-empty publication also has a durable journal and an external rollback snapshot. Re-running a batch reconciles the oldest interrupted publication before accepting new input; that recovery invocation reports its action and stops. A blocked recovery is never guessed through: inspect `status`, repair only the reported condition, and rerun.
+
+Raw HTML is removed only after the corresponding source is included in a confirmed commit and finalized in SQLite. Cleanup is independently retryable, so a cleanup failure never re-renders or recommits a source. Failed synthesis leaves candidate work and raw HTML uncommitted. Re-submit a failed job through the retry command; do not edit the vault source evidence.
 
 An explicit refresh should create a new immutable source version and file rather than overwrite an existing source. The implementation keeps source formatting deterministic: UTF-8, LF endings, fixed frontmatter order, stable hashes, and a trailing newline.

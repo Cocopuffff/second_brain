@@ -31,8 +31,12 @@ def validate_markdown(content: str, *, source: SourceDocument | None = None) -> 
 
 def validate_changes(changes: ChangeSet, sources: list[SourceDocument], vault: Path) -> None:
     source_paths = {source.relative_path for source in sources}
+    seen_paths: set[str] = set()
     for candidate in changes.files:
         path = Path(candidate.relative_path)
+        if candidate.relative_path in seen_paths or candidate.relative_path.casefold() in {value.casefold() for value in seen_paths}:
+            raise ValidationError(f"duplicate executor path: {candidate.relative_path}")
+        seen_paths.add(candidate.relative_path)
         if path.is_absolute() or ".." in path.parts or not str(path).startswith("Concepts/"):
             raise ValidationError(f"executor write escapes Concepts/: {candidate.relative_path}")
         validate_markdown(candidate.content)
@@ -42,8 +46,11 @@ def validate_changes(changes: ChangeSet, sources: list[SourceDocument], vault: P
                 raise ValidationError(f"concept cites unknown source path: {unknown[0]}")
     for deletion in changes.deletions:
         path = Path(deletion)
-        if path.is_absolute() or ".." in path.parts or not str(path).startswith("Concepts/"):
-            raise ValidationError(f"executor deletion escapes Concepts/: {deletion}")
+        if deletion in seen_paths or deletion.casefold() in {value.casefold() for value in seen_paths}:
+            raise ValidationError(f"duplicate executor path: {deletion}")
+        seen_paths.add(deletion)
+        if path.is_absolute() or ".." in path.parts or not (str(path).startswith("Concepts/") or str(path).startswith("Sources/")):
+            raise ValidationError(f"executor deletion escapes the validated vault scopes: {deletion}")
     for source in sources:
         rendered = render_markdown(source)
         validate_markdown(rendered, source=source)

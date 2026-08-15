@@ -62,20 +62,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             state = StateStore(config.database)
             try:
-                print(json.dumps({"batches": state.list_batches(), "jobs": [job.__dict__ for job in state.list_jobs()], "pending_cleanup": [job.id for job in state.pending_cleanup()]}, ensure_ascii=False))
+                pending_cleanup = [job.id for job in state.pending_cleanup()]
+                print(json.dumps({"batches": state.list_batches(), "jobs": [job.__dict__ for job in state.list_jobs()], "publications": state.list_publications(), "pending_cleanup": pending_cleanup, "outstanding_cleanup": len(pending_cleanup)}, ensure_ascii=False))
             finally:
                 state.close()
             return 0
         if args.command == "retry":
             report = runner.run(retry_job_id=args.job_id)
             print(json.dumps(report.__dict__, ensure_ascii=False))
-            return 0 if report.committed else 1
+            return 2 if report.recovery_block_reason else (0 if report.committed else 1)
         if args.command == "batch":
             if args.youtube_fixture:
                 runner.youtube_client = FixtureYouTubeClient(Path(args.youtube_fixture))
             report = runner.run()
             print(json.dumps(report.__dict__, ensure_ascii=False))
-            return 0 if report.committed or report.claimed == 0 else 1
+            return 2 if report.recovery_block_reason else (0 if report.committed or report.claimed == 0 else 1)
     except BatchError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
         return 2

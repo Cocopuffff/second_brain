@@ -35,7 +35,7 @@ def read_article_queue(path: Path) -> tuple[list[ArticleInput], list[str]]:
     return inputs, errors
 
 
-def claim_article_queue(path: Path, state: StateStore, batch_id: str) -> tuple[list[ArticleInput], list[str]]:
+def claim_article_queue(path: Path, state: StateStore, batch_id: str, *, acknowledge: bool = True) -> tuple[list[ArticleInput], list[str]]:
     inputs, errors = read_article_queue(path)
     claimed: list[ArticleInput] = []
     seen: set[str] = set()
@@ -46,7 +46,7 @@ def claim_article_queue(path: Path, state: StateStore, batch_id: str) -> tuple[l
         seen.add(key)
         state.claim("article", key, item.url, input_artifact=None, batch_id=batch_id)
         claimed.append(item)
-    if claimed:
+    if claimed and acknowledge:
         _remove_claimed_urls(path, {canonical_url(item.url) for item in claimed})
     return claimed, errors
 
@@ -55,6 +55,20 @@ def _remove_claimed_urls(path: Path, claimed: set[str]) -> None:
     if not path.exists():
         return
     latest = path.read_text(encoding="utf-8")
+    replacement = remove_claimed_urls_text(latest, claimed)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(replacement)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def remove_claimed_urls_text(latest: str, claimed: set[str]) -> str:
     retained: list[str] = []
     for line in latest.splitlines(keepends=True):
         match = URL_LINE.match(line.rstrip("\r\n"))
@@ -68,13 +82,4 @@ def _remove_claimed_urls(path: Path, claimed: set[str]) -> None:
     replacement = "".join(retained)
     if latest.endswith(("\n", "\r")) and replacement and not replacement.endswith("\n"):
         replacement += "\n"
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-            handle.write(replacement)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    return replacement

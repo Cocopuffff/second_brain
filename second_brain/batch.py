@@ -11,8 +11,8 @@ from .config import Config
 from .extraction import ImageProcessor, extract_article
 from .git_ops import GitError, GitRepository
 from .html_discovery import discover_html, html_hash
-from .models import BatchReport, ChangeSet, SourceDocument, utc_now
-from .publication import BatchPublication, PublicationCrash, PublicationError, PublicationFaults
+from .models import BatchReport, COMMITTED_PUBLICATION_PHASES, ChangeSet, PublicationPhase, SourceDocument, utc_now
+from .publication import BatchPublication, PublicationCrash, PublicationError, PublicationFaults, PublicationResult
 from .queue import claim_article_queue, remove_claimed_urls_text
 from .render import render_markdown, render_source
 from .state import StateStore
@@ -210,32 +210,30 @@ class BatchRunner:
             return self._publication_report(result, state, claimed=claimed_count, completed=len(sources), failed=len(failures), failures=tuple(failures))
         except PublicationCrash:
             raise
-        except PublicationError as exc:
-            journal = state.publication(batch_id)
-            failures.append(str(exc))
-            if journal:
-                recovery = publication.recover_oldest()
-                if recovery:
-                    return self._publication_report(recovery, state, claimed=claimed_count, completed=len(sources), failed=len(failures), failures=tuple(failures))
-                state.update_publication(batch_id, journal["phase"], action="publication_failed", failure_code=exc.code, failure_message=exc.message)
-                phase = journal["phase"]
-            else:
-                state.fail_batch(batch_id)
-                phase = "rolled_back"
-            return BatchReport(batch_id=batch_id, claimed=claimed_count, completed=0, failed=len(failures), committed=False, commit_id=journal.get("commit_id") if journal else None, failures=tuple(failures), publication_phase=phase, recovery_action="publication_failed", publication_failure_code=exc.code, publication_failure_message=exc.message, outstanding_cleanup=len(state.pending_cleanup()))
         except Exception as exc:
+            publication_error = isinstance(exc, PublicationError)
+            failure_code = exc.code if publication_error else "publication_failed"
+            failure_message = exc.message if publication_error else str(exc)
+            if publication_error or not isinstance(exc, ValidationError):
+                failures.append(str(exc))
             journal = state.publication(batch_id)
             if journal:
                 recovery = publication.recover_oldest()
                 if recovery:
-                    failures.append(str(exc))
+                    if recovery.phase != PublicationPhase.RECOVERY_BLOCKED:
+                        if recovery.phase == PublicationPhase.ROLLED_BACK:
+                            state.update_publication(recovery.batch_id, recovery.phase, action=recovery.action, commit_id=recovery.commit_id, failure_code=failure_code, failure_message=failure_message)
+                        recovery = PublicationResult(recovery.batch_id, recovery.phase, recovery.action, recovery.commit_id, failure_code, failure_message)
                     return self._publication_report(recovery, state, claimed=claimed_count, completed=len(sources), failed=len(failures), failures=tuple(failures))
-                state.update_publication(batch_id, journal["phase"], action="publication_failed", failure_code="publication_failed", failure_message=str(exc))
+                state.update_publication(batch_id, journal.phase, action="publication_failed", failure_code=failure_code, failure_message=failure_message)
+                phase = journal.phase
+                commit_id = journal.commit_id
             else:
                 state.fail_batch(batch_id)
-            if not isinstance(exc, ValidationError):
-                failures.append(str(exc))
-            return BatchReport(batch_id=batch_id, claimed=claimed_count, completed=0, failed=len(failures), committed=False, commit_id=journal.get("commit_id") if journal else None, failures=tuple(failures), publication_phase=journal["phase"] if journal else None, recovery_action="publication_failed" if journal else None, publication_failure_code="publication_failed" if journal else None, publication_failure_message=str(exc) if journal else None, outstanding_cleanup=len(state.pending_cleanup()))
+                phase = PublicationPhase.ROLLED_BACK if publication_error else None
+                commit_id = None
+            report_failure = journal is not None or publication_error
+            return BatchReport(batch_id=batch_id, claimed=claimed_count, completed=0, failed=len(failures), committed=False, commit_id=commit_id, failures=tuple(failures), publication_phase=phase, recovery_action="publication_failed" if report_failure else None, publication_failure_code=failure_code if report_failure else None, publication_failure_message=failure_message if report_failure else None, outstanding_cleanup=len(state.pending_cleanup()))
 
     @staticmethod
     def _publication_report(result, state: StateStore, *, claimed: int = 0, completed: int | None = None, failed: int | None = None, failures: tuple[str, ...] = ()) -> BatchReport:
@@ -243,7 +241,7 @@ class BatchRunner:
         completed = sum(job.status == "complete" for job in jobs) if completed is None else completed
         failed = sum(job.status == "failed" for job in jobs) if failed is None else failed
         failures = tuple(job.failure_message for job in jobs if job.failure_message) if not failures else failures
-        return BatchReport(batch_id=result.batch_id, claimed=claimed, completed=completed, failed=failed, committed=result.phase in {"finalized", "cleanup_pending", "complete"}, commit_id=result.commit_id, failures=failures, publication_phase=result.phase, recovery_action=result.action, recovery_block_reason=(result.failure_code or result.failure_message) if result.phase == "recovery_blocked" else None, publication_failure_code=result.failure_code, publication_failure_message=result.failure_message, outstanding_cleanup=len(state.pending_cleanup()))
+        return BatchReport(batch_id=result.batch_id, claimed=claimed, completed=completed, failed=failed, committed=result.phase in COMMITTED_PUBLICATION_PHASES, commit_id=result.commit_id, failures=failures, publication_phase=result.phase, recovery_action=result.action, recovery_block_reason=(result.failure_code or result.failure_message) if result.phase == PublicationPhase.RECOVERY_BLOCKED else None, publication_failure_code=result.failure_code, publication_failure_message=result.failure_message, outstanding_cleanup=len(state.pending_cleanup()))
 
     def _article_source(self, job) -> SourceDocument:
         if job is None:

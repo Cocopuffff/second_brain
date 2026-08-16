@@ -6,21 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from .models import Job, utc_now
-
-
-PUBLICATION_PHASES = frozenset({
-    "candidate_validated",
-    "rollback_snapshot_recorded",
-    "publishing",
-    "published_uncommitted",
-    "committed_unfinalized",
-    "finalized",
-    "cleanup_pending",
-    "complete",
-    "rolled_back",
-    "recovery_blocked",
-})
+from .models import Job, PublicationEntry, PublicationJobRecord, PublicationJournal, PublicationPhase, UNRESOLVED_PUBLICATION_PHASES, publication_transition_allowed, utc_now
 
 
 SCHEMA = """
@@ -122,7 +108,7 @@ class StateStore:
             db.execute("INSERT INTO batches VALUES (?, 'running', ?, ?, NULL)", (batch_id, now, now))
         return batch_id
 
-    def write_publication_journal(self, batch_id: str, *, phase: str, candidate_workspace: str, candidate_manifest_hash: str, base_commit: str, entries: list[dict], jobs: list[dict]) -> None:
+    def write_publication_journal(self, batch_id: str, *, phase: PublicationPhase, candidate_workspace: str, candidate_manifest_hash: str, base_commit: str, entries: list[PublicationEntry], jobs: list[PublicationJobRecord]) -> None:
         now = utc_now()
         with self.transaction() as db:
             db.execute("""INSERT INTO publication_journals
@@ -130,37 +116,38 @@ class StateStore:
                 VALUES (?, ?, ?, ?, ?, ?, ?)""", (batch_id, phase, candidate_workspace, candidate_manifest_hash, base_commit, now, now))
             db.executemany("""INSERT INTO publication_entries
                 (batch_id, ordinal, relative_path, operation, candidate_hash)
-                VALUES (?, ?, ?, ?, ?)""", [(batch_id, index, entry["path"], entry["operation"], entry.get("candidate_hash")) for index, entry in enumerate(entries)])
+                VALUES (?, ?, ?, ?, ?)""", [(batch_id, index, entry.relative_path, entry.operation, entry.candidate_hash) for index, entry in enumerate(entries)])
             db.executemany("""INSERT INTO publication_jobs
                 (batch_id, job_id, role, expected_content_hash, raw_path, raw_hash)
-                VALUES (?, ?, ?, ?, ?, ?)""", [(batch_id, item["job_id"], item["role"], item.get("expected_content_hash"), item.get("raw_path"), item.get("raw_hash")) for item in jobs])
+                VALUES (?, ?, ?, ?, ?, ?)""", [(batch_id, item.job_id, item.role, item.expected_content_hash, item.raw_path, item.raw_hash) for item in jobs])
 
-    def publication(self, batch_id: str) -> dict | None:
+    def publication(self, batch_id: str) -> PublicationJournal | None:
         row = self.connection.execute("SELECT * FROM publication_journals WHERE batch_id=?", (batch_id,)).fetchone()
-        return dict(row) if row else None
+        return self._publication_journal(row) if row else None
 
-    def publication_entries(self, batch_id: str) -> list[dict]:
-        return [dict(row) for row in self.connection.execute("SELECT * FROM publication_entries WHERE batch_id=? ORDER BY ordinal", (batch_id,))]
+    def publication_entries(self, batch_id: str) -> list[PublicationEntry]:
+        return [PublicationEntry(relative_path=row["relative_path"], operation=row["operation"], candidate_hash=row["candidate_hash"]) for row in self.connection.execute("SELECT * FROM publication_entries WHERE batch_id=? ORDER BY ordinal", (batch_id,))]
 
-    def publication_jobs(self, batch_id: str) -> list[dict]:
-        return [dict(row) for row in self.connection.execute("SELECT * FROM publication_jobs WHERE batch_id=? ORDER BY job_id", (batch_id,))]
+    def publication_jobs(self, batch_id: str) -> list[PublicationJobRecord]:
+        return [PublicationJobRecord(job_id=row["job_id"], role=row["role"], expected_content_hash=row["expected_content_hash"], raw_path=row["raw_path"], raw_hash=row["raw_hash"]) for row in self.connection.execute("SELECT * FROM publication_jobs WHERE batch_id=? ORDER BY job_id", (batch_id,))]
 
-    def oldest_unresolved_publication(self) -> dict | None:
-        row = self.connection.execute("""SELECT * FROM publication_journals
-            WHERE phase IN ('candidate_validated', 'rollback_snapshot_recorded', 'publishing', 'published_uncommitted', 'committed_unfinalized', 'recovery_blocked')
-            ORDER BY created_at, batch_id LIMIT 1""").fetchone()
-        return dict(row) if row else None
+    def oldest_unresolved_publication(self) -> PublicationJournal | None:
+        phases = tuple(phase.value for phase in UNRESOLVED_PUBLICATION_PHASES)
+        placeholders = ", ".join("?" for _ in phases)
+        row = self.connection.execute(f"""SELECT * FROM publication_journals
+            WHERE phase IN ({placeholders})
+            ORDER BY created_at, batch_id LIMIT 1""", phases).fetchone()
+        return self._publication_journal(row) if row else None
 
-    def list_publications(self) -> list[dict]:
-        return [dict(row) for row in self.connection.execute("SELECT * FROM publication_journals ORDER BY created_at DESC, batch_id DESC")]
+    def list_publications(self) -> list[PublicationJournal]:
+        return [self._publication_journal(row) for row in self.connection.execute("SELECT * FROM publication_journals ORDER BY created_at DESC, batch_id DESC")]
 
-    def update_publication(self, batch_id: str, phase: str, *, action: str | None = None, commit_id: str | None = None, failure_code: str | None = None, failure_message: str | None = None, blocked_from_phase: str | None = None) -> None:
-        if phase not in PUBLICATION_PHASES:
-            raise ValueError(f"unknown publication phase: {phase}")
+    def update_publication(self, batch_id: str, phase: PublicationPhase, *, action: str | None = None, commit_id: str | None = None, failure_code: str | None = None, failure_message: str | None = None, blocked_from_phase: PublicationPhase | None = None) -> None:
         with self.transaction() as db:
             current = db.execute("SELECT phase FROM publication_journals WHERE batch_id=?", (batch_id,)).fetchone()
             if not current:
                 raise KeyError(batch_id)
+            self._require_publication_transition(PublicationPhase(current["phase"]), phase)
             db.execute("""UPDATE publication_journals
                 SET phase=?, recovery_action=COALESCE(?, recovery_action), commit_id=COALESCE(?, commit_id),
                     failure_code=?, failure_message=?, blocked_from_phase=COALESCE(?, blocked_from_phase), updated_at=?
@@ -176,6 +163,7 @@ class StateStore:
             journal = db.execute("SELECT * FROM publication_journals WHERE batch_id=?", (batch_id,)).fetchone()
             if not journal:
                 raise KeyError(batch_id)
+            self._require_publication_transition(PublicationPhase(journal["phase"]), PublicationPhase.FINALIZED)
             for row in db.execute("SELECT * FROM publication_jobs WHERE batch_id=? AND role='source'", (batch_id,)):
                 job = db.execute("SELECT * FROM jobs WHERE id=?", (row["job_id"],)).fetchone()
                 if not job or job["batch_id"] != batch_id or job["status"] not in {"source_ready", "complete"} or job["content_hash"] != row["expected_content_hash"]:
@@ -184,15 +172,23 @@ class StateStore:
             db.execute("""UPDATE jobs SET queue_acknowledged=1, updated_at=?
                 WHERE id IN (SELECT job_id FROM publication_jobs WHERE batch_id=? AND role='queue_ack')""", (now, batch_id))
             db.execute("UPDATE batches SET status='complete', commit_id=?, updated_at=? WHERE id=?", (commit_id, now, batch_id))
-            db.execute("""UPDATE publication_journals SET phase='finalized', commit_id=?, recovery_action='finalized', failure_code=NULL, failure_message=NULL, updated_at=? WHERE batch_id=?""", (commit_id, now, batch_id))
+            db.execute("""UPDATE publication_journals SET phase=?, commit_id=?, recovery_action='finalized', failure_code=NULL, failure_message=NULL, updated_at=? WHERE batch_id=?""", (PublicationPhase.FINALIZED, commit_id, now, batch_id))
 
     def mark_publication_cleanup_pending(self, batch_id: str) -> None:
         with self.transaction() as db:
-            db.execute("UPDATE publication_journals SET phase='cleanup_pending', updated_at=? WHERE batch_id=? AND phase='finalized'", (utc_now(), batch_id))
+            journal = db.execute("SELECT phase FROM publication_journals WHERE batch_id=?", (batch_id,)).fetchone()
+            if not journal:
+                raise KeyError(batch_id)
+            self._require_publication_transition(PublicationPhase(journal["phase"]), PublicationPhase.CLEANUP_PENDING)
+            db.execute("UPDATE publication_journals SET phase=?, updated_at=? WHERE batch_id=? AND phase=?", (PublicationPhase.CLEANUP_PENDING, utc_now(), batch_id, PublicationPhase.FINALIZED))
 
     def mark_publication_complete(self, batch_id: str) -> None:
         with self.transaction() as db:
-            db.execute("UPDATE publication_journals SET phase='complete', recovery_action='complete', updated_at=? WHERE batch_id=? AND phase IN ('finalized', 'cleanup_pending')", (utc_now(), batch_id))
+            journal = db.execute("SELECT phase FROM publication_journals WHERE batch_id=?", (batch_id,)).fetchone()
+            if not journal:
+                raise KeyError(batch_id)
+            self._require_publication_transition(PublicationPhase(journal["phase"]), PublicationPhase.COMPLETE)
+            db.execute("UPDATE publication_journals SET phase=?, recovery_action='complete', updated_at=? WHERE batch_id=? AND phase IN (?, ?)", (PublicationPhase.COMPLETE, utc_now(), batch_id, PublicationPhase.FINALIZED, PublicationPhase.CLEANUP_PENDING))
 
     def recover(self) -> None:
         now = utc_now()
@@ -280,3 +276,16 @@ class StateStore:
 
     def _job(self, row: sqlite3.Row) -> Job:
         return Job(id=row["id"], kind=row["kind"], source_key=row["source_key"], original_locator=row["original_locator"], input_artifact=row["input_artifact"], batch_id=row["batch_id"], status=row["status"], attempts=row["attempts"], retryable=bool(row["retryable"]), failure_code=row["failure_code"], failure_message=row["failure_message"], content_hash=row["content_hash"], source_version=row["source_version"], captured_at=row["captured_at"], queue_acknowledged=bool(row["queue_acknowledged"]), cleanup_pending=bool(row["cleanup_pending"]), commit_id=row["commit_id"])
+
+    @staticmethod
+    def _publication_journal(row: sqlite3.Row) -> PublicationJournal:
+        values = dict(row)
+        values["phase"] = PublicationPhase(values["phase"])
+        if values["blocked_from_phase"] is not None:
+            values["blocked_from_phase"] = PublicationPhase(values["blocked_from_phase"])
+        return PublicationJournal(**values)
+
+    @staticmethod
+    def _require_publication_transition(current: PublicationPhase, target: PublicationPhase) -> None:
+        if not publication_transition_allowed(current, target):
+            raise ValueError(f"invalid publication transition: {current.value} -> {target.value}")

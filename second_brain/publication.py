@@ -11,7 +11,7 @@ from typing import Any, Protocol
 
 from .config import Config
 from .git_ops import GitError, GitRepository
-from .models import Job
+from .models import CLEANUP_PUBLICATION_PHASES, Job, PublicationEntry, PublicationJobRecord, PublicationJournal, PublicationPhase, PublicationSnapshotEntry
 from .state import StateStore
 
 
@@ -38,7 +38,7 @@ class PublicationCrash(RuntimeError):
 @dataclass(frozen=True)
 class PublicationResult:
     batch_id: str
-    phase: str
+    phase: PublicationPhase
     action: str | None = None
     commit_id: str | None = None
     failure_code: str | None = None
@@ -57,37 +57,43 @@ class BatchPublication:
         journal = self.state.oldest_unresolved_publication()
         if not journal:
             return None
-        batch_id = journal["batch_id"]
-        phase = journal["blocked_from_phase"] or journal["phase"]
+        batch_id = journal.batch_id
+        phase = journal.blocked_from_phase or journal.phase
         try:
             self._validate_journal(journal)
         except PublicationError as exc:
             return self._block(journal, exc.code, exc.message)
-        if phase == "committed_unfinalized":
-            commit_id = self._verified_commit(journal)
+        if phase == PublicationPhase.COMMITTED_UNFINALIZED:
+            try:
+                commit_id = self._verified_commit(journal)
+            except PublicationError as exc:
+                return self._block(journal, exc.code, exc.message)
             if not commit_id:
                 return self._block(journal, "publication_commit_missing_or_mismatched", "the recorded commit could not be proven to match the journal")
             return self._finalize_existing(journal, commit_id, "recovered_committed_batch")
-        if phase in {"candidate_validated"}:
-            self.state.update_publication(batch_id, "rolled_back", action="discarded_unpublished_candidate")
+        if phase == PublicationPhase.CANDIDATE_VALIDATED:
+            self.state.update_publication(batch_id, PublicationPhase.ROLLED_BACK, action="discarded_unpublished_candidate")
             self.state.fail_batch(batch_id)
             self._compact(batch_id)
-            return PublicationResult(batch_id, "rolled_back", "discarded_unpublished_candidate")
-        commit_id = self._verified_commit(journal)
+            return PublicationResult(batch_id, PublicationPhase.ROLLED_BACK, "discarded_unpublished_candidate")
+        try:
+            commit_id = self._verified_commit(journal)
+        except PublicationError as exc:
+            return self._block(journal, exc.code, exc.message)
         if commit_id:
             return self._finalize_existing(journal, commit_id, "recovered_existing_commit")
-        if journal["base_commit"] != self.git.head():
+        if journal.base_commit != self.git.head():
             return self._block(journal, "publication_head_changed", "Git HEAD changed before the batch could be reconciled")
         try:
             self._verify_live_state(journal)
-            self.git.restore_staged([entry["relative_path"] for entry in self.state.publication_entries(batch_id)])
+            self.git.restore_staged([entry.relative_path for entry in self.state.publication_entries(batch_id)])
             self._restore_snapshot(journal)
         except PublicationError as exc:
             return self._block(journal, exc.code, exc.message)
-        self.state.update_publication(batch_id, "rolled_back", action="rolled_back_uncommitted", failure_code=None, failure_message=None)
+        self.state.update_publication(batch_id, PublicationPhase.ROLLED_BACK, action="rolled_back_uncommitted", failure_code=None, failure_message=None)
         self.state.fail_batch(batch_id)
         self._compact(batch_id)
-        return PublicationResult(batch_id, "rolled_back", "rolled_back_uncommitted")
+        return PublicationResult(batch_id, PublicationPhase.ROLLED_BACK, "rolled_back_uncommitted")
 
     def publish(self, batch_id: str, files: dict[str, str], deletions: tuple[str, ...], *, queue_path: str | None, queue_job_ids: list[str], source_jobs: list[Job], raw_fingerprints: dict[str, tuple[str, str | None]] | None = None) -> PublicationResult:
         entries = self._prepare_entries(files, deletions, queue_path)
@@ -95,82 +101,92 @@ class BatchPublication:
             raise PublicationError("empty_publication", "validated candidate has no changes")
         workspace = self.root / batch_id
         payload = workspace / "candidate"
+        self._assert_external_path_safe(workspace, self.root, "candidate workspace")
+        self._assert_external_path_safe(payload, workspace, "candidate payload")
         payload.mkdir(parents=True, exist_ok=True)
-        manifest = {"batch_id": batch_id, "entries": entries}
+        manifest = {"batch_id": batch_id, "entries": [self._entry_manifest(entry) for entry in entries]}
         for entry in entries:
             self._materialize_entry(payload, entry, files)
         self._validate_candidate_manifest(batch_id, workspace, manifest, entries)
-        self._write_json(workspace / "manifest.json", manifest)
+        manifest_path = workspace / "manifest.json"
+        self._assert_external_path_safe(manifest_path, workspace, "candidate manifest")
+        self._write_json(manifest_path, manifest)
         manifest_hash = self._sha256_json(manifest)
-        self.state.write_publication_journal(batch_id, phase="candidate_validated", candidate_workspace=str(workspace), candidate_manifest_hash=manifest_hash, base_commit=self.git.head(), entries=entries, jobs=self._job_records(queue_job_ids, source_jobs, raw_fingerprints or {}))
+        self.state.write_publication_journal(batch_id, phase=PublicationPhase.CANDIDATE_VALIDATED, candidate_workspace=str(workspace), candidate_manifest_hash=manifest_hash, base_commit=self.git.head(), entries=entries, jobs=self._job_records(queue_job_ids, source_jobs, raw_fingerprints or {}))
         self._fault("journal_written", batch_id=batch_id)
 
         snapshot = self._capture_snapshot(workspace, entries)
         self.state.record_snapshot(batch_id, str(workspace / "rollback"), snapshot["hash"])
-        self.state.update_publication(batch_id, "rollback_snapshot_recorded")
+        self.state.update_publication(batch_id, PublicationPhase.ROLLBACK_SNAPSHOT_RECORDED)
         self._fault("snapshot_captured", batch_id=batch_id)
 
-        self.state.update_publication(batch_id, "publishing")
+        self.state.update_publication(batch_id, PublicationPhase.PUBLISHING)
         for entry in entries:
             self._publish_entry(entry, payload)
-            self._fault("file_published", batch_id=batch_id, path=entry["path"])
-        self.state.update_publication(batch_id, "published_uncommitted")
+            self._fault("file_published", batch_id=batch_id, path=entry.relative_path)
+        self.state.update_publication(batch_id, PublicationPhase.PUBLISHED_UNCOMMITTED)
         self._fault("published_uncommitted", batch_id=batch_id)
 
-        paths = [entry["path"] for entry in entries]
+        paths = [entry.relative_path for entry in entries]
         message = f"ingest: batch {batch_id} ({len(source_jobs)} complete)\n\nBatch-ID: {batch_id}"
         try:
             commit_id = self.git.commit_paths(paths, message)
         except GitError as exc:
-            commit_id = self._verified_commit(self.state.publication(batch_id) or {})
+            journal = self._journal(batch_id)
+            try:
+                commit_id = self._verified_commit(journal)
+            except PublicationError as mismatch:
+                return self._block(journal, mismatch.code, mismatch.message)
             if not commit_id:
                 try:
-                    self._verify_live_state(self.state.publication(batch_id) or {})
-                    self._restore_snapshot(self.state.publication(batch_id) or {})
-                    self.state.update_publication(batch_id, "rolled_back", action="rolled_back_git_failure", failure_code="git_commit_failed", failure_message=str(exc))
+                    self._verify_live_state(journal)
+                    self._restore_snapshot(journal)
+                    self.state.update_publication(batch_id, PublicationPhase.ROLLED_BACK, action="rolled_back_git_failure", failure_code="git_commit_failed", failure_message=str(exc))
                     self.state.fail_batch(batch_id)
                     self._compact(batch_id)
-                    return PublicationResult(batch_id, "rolled_back", "rolled_back_git_failure", failure_code="git_commit_failed", failure_message=str(exc))
+                    return PublicationResult(batch_id, PublicationPhase.ROLLED_BACK, "rolled_back_git_failure", failure_code="git_commit_failed", failure_message=str(exc))
                 except PublicationError as rollback_error:
-                    return self._block(self.state.publication(batch_id) or {}, rollback_error.code, rollback_error.message)
+                    return self._block(journal, rollback_error.code, rollback_error.message)
             else:
-                return self._finalize_existing(self.state.publication(batch_id) or {}, commit_id, "recovered_commit_after_git_error")
+                return self._finalize_existing(journal, commit_id, "recovered_commit_after_git_error")
         self._fault("git_commit", batch_id=batch_id, commit_id=commit_id)
-        self.state.update_publication(batch_id, "committed_unfinalized", commit_id=commit_id)
+        self.state.update_publication(batch_id, PublicationPhase.COMMITTED_UNFINALIZED, commit_id=commit_id)
         self._fault("commit_journaled", batch_id=batch_id, commit_id=commit_id)
-        return self._finalize_existing(self.state.publication(batch_id) or {}, commit_id, "published_and_committed")
+        return self._finalize_existing(self._journal(batch_id), commit_id, "published_and_committed")
 
     def retry_cleanup(self) -> PublicationResult | None:
-        result: PublicationResult | None = None
-        for journal in self.state.list_publications():
-            if journal["phase"] not in {"finalized", "cleanup_pending"}:
+        for journal in reversed(self.state.list_publications()):
+            if journal.phase not in CLEANUP_PUBLICATION_PHASES:
                 continue
             self._cleanup_journal(journal)
-            current = self.state.publication(journal["batch_id"]) or journal
-            result = PublicationResult(
-                journal["batch_id"],
-                current["phase"],
-                current.get("recovery_action"),
-                current.get("commit_id"),
-                current.get("failure_code"),
-                current.get("failure_message"),
+            current = self.state.publication(journal.batch_id) or journal
+            return PublicationResult(
+                journal.batch_id,
+                current.phase,
+                current.recovery_action,
+                current.commit_id,
+                current.failure_code,
+                current.failure_message,
             )
-        return result
+        return None
 
-    def _finalize_existing(self, journal: dict, commit_id: str, action: str) -> PublicationResult:
-        batch_id = journal["batch_id"]
+    def _finalize_existing(self, journal: PublicationJournal, commit_id: str, action: str) -> PublicationResult:
+        batch_id = journal.batch_id
         entries = self.state.publication_entries(batch_id)
-        hashes = {entry["relative_path"]: entry["candidate_hash"] for entry in entries}
-        paths = [entry["relative_path"] for entry in entries]
-        if not self.git.verify_commit(commit_id, paths, hashes, journal["base_commit"]):
+        hashes = {entry.relative_path: entry.candidate_hash for entry in entries}
+        paths = [entry.relative_path for entry in entries]
+        if not self.git.verify_commit(commit_id, paths, hashes, journal.base_commit, journal.batch_id):
             return self._block(journal, "publication_commit_mismatch", "the discovered commit does not match the journaled path set or content")
+        if journal.phase != PublicationPhase.COMMITTED_UNFINALIZED:
+            self.state.update_publication(batch_id, PublicationPhase.COMMITTED_UNFINALIZED, commit_id=commit_id)
+            journal = self._journal(batch_id)
         try:
             for entry in entries:
-                target = self._live_path(entry["relative_path"])
+                target = self._live_path(entry.relative_path)
                 self._assert_parent_safe(target)
                 current = self._sha256_file(target) if target.exists() else None
-                if current != entry["candidate_hash"]:
-                    raise PublicationError("live_path_diverged", f"live path no longer matches the committed batch: {entry['relative_path']}")
+                if current != entry.candidate_hash:
+                    raise PublicationError("live_path_diverged", f"live path no longer matches the committed batch: {entry.relative_path}")
         except PublicationError as exc:
             return self._block(journal, exc.code, exc.message)
         try:
@@ -180,40 +196,40 @@ class BatchPublication:
         self._fault("sqlite_finalized", batch_id=batch_id, commit_id=commit_id)
         self._cleanup_journal(self.state.publication(batch_id) or journal)
         final = self.state.publication(batch_id) or journal
-        return PublicationResult(batch_id, final["phase"], action, commit_id, final.get("failure_code"), final.get("failure_message"))
+        return PublicationResult(batch_id, final.phase, action, commit_id, final.failure_code, final.failure_message)
 
-    def _cleanup_journal(self, journal: dict) -> int:
-        batch_id = journal["batch_id"]
+    def _cleanup_journal(self, journal: PublicationJournal) -> int:
+        batch_id = journal.batch_id
         jobs = self.state.publication_jobs(batch_id)
-        pending = [item for item in jobs if item["role"] == "source" and self.state.get(item["job_id"]) and self.state.get(item["job_id"]).cleanup_pending]
+        pending = [item for item in jobs if item.role == "source" and self.state.get(item.job_id) and self.state.get(item.job_id).cleanup_pending]
         if pending:
             self.state.mark_publication_cleanup_pending(batch_id)
         cleaned = 0
         for item in pending:
-            path = Path(item["raw_path"]) if item["raw_path"] else None
+            path = Path(item.raw_path) if item.raw_path else None
             try:
                 if path is not None:
-                    self._assert_under(path, self.config.to_ingest, "raw payload")
+                    self._assert_external_path_safe(path, self.config.to_ingest, "raw payload")
                     if path.exists():
-                        if not item["raw_hash"]:
+                        if not item.raw_hash:
                             raise PublicationError("cleanup_payload_unverified", f"raw payload fingerprint is unavailable: {path.name}")
-                        if self._sha256_file(path) != item["raw_hash"]:
+                        if self._sha256_file(path) != item.raw_hash:
                             raise PublicationError("cleanup_payload_changed", f"raw payload changed before cleanup: {path.name}")
                         path.unlink()
                         self._fsync_dir(path.parent)
-                        self._fault("raw_payload_removed", batch_id=batch_id, job_id=item["job_id"])
-                self.state.mark_cleanup_done(item["job_id"])
-                self._fault("cleanup_marked", batch_id=batch_id, job_id=item["job_id"])
+                        self._fault("raw_payload_removed", batch_id=batch_id, job_id=item.job_id)
+                self.state.mark_cleanup_done(item.job_id)
+                self._fault("cleanup_marked", batch_id=batch_id, job_id=item.job_id)
                 cleaned += 1
             except PublicationError as exc:
-                self.state.update_publication(batch_id, "cleanup_pending", action="cleanup_pending", failure_code=exc.code, failure_message=exc.message)
+                self.state.update_publication(batch_id, PublicationPhase.CLEANUP_PENDING, action="cleanup_pending", failure_code=exc.code, failure_message=exc.message)
             except OSError as exc:
-                self.state.update_publication(batch_id, "cleanup_pending", action="cleanup_pending", failure_code="cleanup_failed", failure_message=str(exc))
+                self.state.update_publication(batch_id, PublicationPhase.CLEANUP_PENDING, action="cleanup_pending", failure_code="cleanup_failed", failure_message=str(exc))
         remaining = [
             item
             for item in jobs
-            if item["role"] == "source"
-            and (job := self.state.get(item["job_id"])) is not None
+            if item.role == "source"
+            and (job := self.state.get(item.job_id)) is not None
             and job.cleanup_pending
         ]
         if not remaining:
@@ -221,7 +237,7 @@ class BatchPublication:
             self._compact(batch_id)
         return cleaned
 
-    def _prepare_entries(self, files: dict[str, str], deletions: tuple[str, ...], queue_path: str | None) -> list[dict]:
+    def _prepare_entries(self, files: dict[str, str], deletions: tuple[str, ...], queue_path: str | None) -> list[PublicationEntry]:
         operations: dict[str, tuple[str, str | None]] = {}
         for path, content in files.items():
             self._validate_path(path, queue_path)
@@ -247,54 +263,66 @@ class BatchPublication:
                 continue
             if operation == "delete" and not target.exists():
                 continue
-            ordered.append({"path": path, "operation": operation, "candidate_hash": candidate_hash})
+            ordered.append(PublicationEntry(relative_path=path, operation=operation, candidate_hash=candidate_hash))
         return ordered
 
-    def _capture_snapshot(self, workspace: Path, entries: list[dict]) -> dict:
+    def _capture_snapshot(self, workspace: Path, entries: list[PublicationEntry]) -> dict:
         rollback = workspace / "rollback"
         payload = rollback / "payload"
+        self._assert_external_path_safe(rollback, workspace, "rollback workspace")
+        self._assert_external_path_safe(payload, rollback, "rollback payload")
         payload.mkdir(parents=True, exist_ok=True)
-        snapshot_entries: list[dict] = []
+        snapshot_entries: list[PublicationSnapshotEntry] = []
         for entry in entries:
-            target = self._live_path(entry["path"])
+            target = self._live_path(entry.relative_path)
             if target.exists() or target.is_symlink():
                 self._assert_regular(target, "live path")
                 content = target.read_bytes()
-                snapshot_entries.append({"path": entry["path"], "exists": True, "hash": hashlib.sha256(content).hexdigest()})
-                destination = payload / entry["path"]
+                snapshot_entries.append(PublicationSnapshotEntry(entry.relative_path, True, hashlib.sha256(content).hexdigest()))
+                destination = payload / entry.relative_path
+                self._assert_external_path_safe(destination, payload, "rollback payload")
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 self._atomic_replace_bytes(destination, content, f".{destination.name}.snapshot.")
             else:
-                snapshot_entries.append({"path": entry["path"], "exists": False, "hash": None})
-        manifest = {"entries": snapshot_entries}
-        self._write_json(rollback / "manifest.json", manifest)
+                snapshot_entries.append(PublicationSnapshotEntry(entry.relative_path, False, None))
+        manifest = {"entries": [self._snapshot_manifest(entry) for entry in snapshot_entries]}
+        manifest_path = rollback / "manifest.json"
+        self._assert_external_path_safe(manifest_path, rollback, "rollback manifest")
+        self._write_json(manifest_path, manifest)
         return {"hash": self._sha256_json(manifest), "entries": snapshot_entries}
 
-    def _materialize_entry(self, payload: Path, entry: dict, files: dict[str, str]) -> None:
-        if entry["operation"] != "write":
+    def _materialize_entry(self, payload: Path, entry: PublicationEntry, files: dict[str, str]) -> None:
+        if entry.operation != "write":
             return
-        destination = payload / entry["path"]
+        destination = payload / entry.relative_path
+        self._assert_external_path_safe(destination, payload, "candidate payload")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        self._atomic_replace_bytes(destination, files[entry["path"]].encode("utf-8"), f".{destination.name}.candidate.")
+        self._atomic_replace_bytes(destination, files[entry.relative_path].encode("utf-8"), f".{destination.name}.candidate.")
 
-    def _publish_entry(self, entry: dict, payload: Path) -> None:
-        target = self._live_path(entry["path"])
+    def _publish_entry(self, entry: PublicationEntry, payload: Path) -> None:
+        target = self._live_path(entry.relative_path)
         self._assert_parent_safe(target)
-        if entry["operation"] == "delete":
+        if entry.operation == "delete":
             if target.exists():
                 self._assert_regular(target, "live path")
                 target.unlink()
                 self._fsync_dir(target.parent)
             return
         target.parent.mkdir(parents=True, exist_ok=True)
-        self._atomic_replace_bytes(target, (payload / entry["path"]).read_bytes(), f".{target.name}.")
+        candidate = payload / entry.relative_path
+        self._assert_external_path_safe(candidate, payload, "candidate payload")
+        self._atomic_replace_bytes(target, candidate.read_bytes(), f".{target.name}.")
 
-    def _verify_live_state(self, journal: dict) -> None:
-        workspace = Path(journal["candidate_workspace"])
-        manifest = self._read_json(workspace / "manifest.json")
-        snapshot = self._read_json(workspace / "rollback" / "manifest.json")
-        by_path = {entry["path"]: entry for entry in manifest["entries"]}
-        snap_by_path = {entry["path"]: entry for entry in snapshot["entries"]}
+    def _verify_live_state(self, journal: PublicationJournal) -> None:
+        workspace = Path(journal.candidate_workspace)
+        manifest_path = workspace / "manifest.json"
+        snapshot_path = workspace / "rollback" / "manifest.json"
+        self._assert_external_path_safe(manifest_path, workspace, "candidate manifest")
+        self._assert_external_path_safe(snapshot_path, workspace / "rollback", "rollback manifest")
+        manifest = self._read_json(manifest_path)
+        snapshot = self._read_json(snapshot_path)
+        by_path = {entry.relative_path: entry for entry in self._manifest_entries(manifest)}
+        snap_by_path = {entry.relative_path: entry for entry in self._snapshot_entries(snapshot)}
         for path, candidate in by_path.items():
             target = self._live_path(path)
             snap = snap_by_path[path]
@@ -303,86 +331,129 @@ class BatchPublication:
                 current = self._sha256_file(target)
             else:
                 current = None
-            if current not in {snap["hash"], candidate["candidate_hash"]}:
+            if current not in {snap.content_hash, candidate.candidate_hash}:
                 raise PublicationError("live_path_diverged", f"live path changed outside the batch: {path}")
 
-    def _validate_journal(self, journal: dict) -> None:
-        workspace = Path(journal["candidate_workspace"])
-        self._assert_under(workspace, self.config.state_dir, "candidate workspace")
-        manifest = self._read_json(workspace / "manifest.json")
-        if manifest.get("batch_id") != journal["batch_id"] or self._sha256_json(manifest) != journal["candidate_manifest_hash"]:
+    def _validate_journal(self, journal: PublicationJournal) -> None:
+        workspace = Path(journal.candidate_workspace)
+        self._assert_external_path_safe(workspace, self.root, "candidate workspace")
+        manifest_path = workspace / "manifest.json"
+        self._assert_external_path_safe(manifest_path, workspace, "candidate manifest")
+        manifest = self._read_json(manifest_path)
+        if manifest.get("batch_id") != journal.batch_id or self._sha256_json(manifest) != journal.candidate_manifest_hash:
             raise PublicationError("manifest_invalid", "candidate manifest identity or contents do not match the journal")
-        db_entries = self.state.publication_entries(journal["batch_id"])
-        expected = [{"path": row["relative_path"], "operation": row["operation"], "candidate_hash": row["candidate_hash"]} for row in db_entries]
-        if manifest.get("entries") != expected:
+        db_entries = self.state.publication_entries(journal.batch_id)
+        manifest_entries = self._manifest_entries(manifest)
+        if manifest_entries != db_entries:
             raise PublicationError("manifest_invalid", "candidate manifest path set does not match the journal")
-        for entry in expected:
-            if entry["operation"] == "write":
-                candidate = workspace / "candidate" / entry["path"]
-                self._assert_under(candidate, workspace / "candidate", "candidate payload")
-                if not candidate.is_file() or self._sha256_file(candidate) != entry["candidate_hash"]:
-                    raise PublicationError("manifest_invalid", f"candidate payload does not match its fingerprint: {entry['path']}")
-        if (journal.get("blocked_from_phase") or journal["phase"]) != "candidate_validated":
-            rollback = Path(journal["snapshot_workspace"] or workspace / "rollback")
-            self._assert_under(rollback, self.config.state_dir, "rollback workspace")
+        for entry in db_entries:
+            if entry.operation == "write":
+                candidate = workspace / "candidate" / entry.relative_path
+                self._assert_external_path_safe(candidate, workspace / "candidate", "candidate payload")
+                if not candidate.is_file() or self._sha256_file(candidate) != entry.candidate_hash:
+                    raise PublicationError("manifest_invalid", f"candidate payload does not match its fingerprint: {entry.relative_path}")
+        if (journal.blocked_from_phase or journal.phase) != PublicationPhase.CANDIDATE_VALIDATED:
+            rollback = Path(journal.snapshot_workspace or workspace / "rollback")
+            self._assert_external_path_safe(rollback, workspace, "rollback workspace")
             snapshot_path = rollback / "manifest.json"
+            self._assert_external_path_safe(snapshot_path, rollback, "rollback manifest")
             snapshot = self._read_json(snapshot_path)
-            if journal["snapshot_manifest_hash"] != self._sha256_json(snapshot):
+            if journal.snapshot_manifest_hash != self._sha256_json(snapshot):
                 raise PublicationError("snapshot_invalid", "rollback snapshot identity does not match the journal")
-            for entry in snapshot.get("entries", []):
-                if entry["exists"]:
-                    payload = rollback / "payload" / entry["path"]
-                    self._assert_under(payload, rollback / "payload", "rollback payload")
-                    if not payload.is_file() or self._sha256_file(payload) != entry["hash"]:
-                        raise PublicationError("snapshot_invalid", f"rollback payload does not match its fingerprint: {entry['path']}")
+            for entry in self._snapshot_entries(snapshot):
+                if entry.existed:
+                    payload = rollback / "payload" / entry.relative_path
+                    self._assert_external_path_safe(payload, rollback / "payload", "rollback payload")
+                    if not payload.is_file() or self._sha256_file(payload) != entry.content_hash:
+                        raise PublicationError("snapshot_invalid", f"rollback payload does not match its fingerprint: {entry.relative_path}")
 
-    def _restore_snapshot(self, journal: dict) -> None:
-        workspace = Path(journal["candidate_workspace"])
-        snapshot = self._read_json(workspace / "rollback" / "manifest.json")
+    def _restore_snapshot(self, journal: PublicationJournal) -> None:
+        workspace = Path(journal.candidate_workspace)
+        rollback = workspace / "rollback"
+        snapshot_path = rollback / "manifest.json"
+        self._assert_external_path_safe(snapshot_path, rollback, "rollback manifest")
+        snapshot = self._read_json(snapshot_path)
         payload = workspace / "rollback" / "payload"
-        for entry in snapshot["entries"]:
-            target = self._live_path(entry["path"])
+        for entry in self._snapshot_entries(snapshot):
+            target = self._live_path(entry.relative_path)
             self._assert_parent_safe(target)
-            if entry["exists"]:
-                source = payload / entry["path"]
+            if entry.existed:
+                source = payload / entry.relative_path
+                self._assert_external_path_safe(source, payload, "rollback payload")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 self._atomic_replace_bytes(target, source.read_bytes(), f".{target.name}.rollback.")
             elif target.exists():
                 target.unlink()
                 self._fsync_dir(target.parent)
 
-    def _verified_commit(self, journal: dict) -> str | None:
-        if not journal:
-            return None
-        commit_id = journal.get("commit_id") or self.git.find_batch_commit(journal["batch_id"])
+    def _verified_commit(self, journal: PublicationJournal) -> str | None:
+        commit_id = journal.commit_id or self.git.find_batch_commit(journal.batch_id)
         if not commit_id:
             return None
-        entries = self.state.publication_entries(journal["batch_id"])
-        return commit_id if self.git.verify_commit(commit_id, [entry["relative_path"] for entry in entries], {entry["relative_path"]: entry["candidate_hash"] for entry in entries}, journal["base_commit"]) else None
+        entries = self.state.publication_entries(journal.batch_id)
+        if not self.git.verify_commit(commit_id, [entry.relative_path for entry in entries], {entry.relative_path: entry.candidate_hash for entry in entries}, journal.base_commit, journal.batch_id):
+            raise PublicationError("publication_commit_mismatch", "a commit with the batch identifier does not match the journaled path set or content")
+        return commit_id
 
-    def _block(self, journal: dict, code: str, message: str) -> PublicationResult:
-        batch_id = journal["batch_id"]
-        previous = journal.get("blocked_from_phase") or journal.get("phase")
-        self.state.update_publication(batch_id, "recovery_blocked", action="recovery_blocked", failure_code=code, failure_message=message, blocked_from_phase=previous)
-        return PublicationResult(batch_id, "recovery_blocked", "recovery_blocked", journal.get("commit_id"), code, message)
+    def _block(self, journal: PublicationJournal, code: str, message: str) -> PublicationResult:
+        batch_id = journal.batch_id
+        previous = journal.blocked_from_phase or journal.phase
+        self.state.update_publication(batch_id, PublicationPhase.RECOVERY_BLOCKED, action="recovery_blocked", failure_code=code, failure_message=message, blocked_from_phase=previous)
+        return PublicationResult(batch_id, PublicationPhase.RECOVERY_BLOCKED, "recovery_blocked", journal.commit_id, code, message)
 
-    def _job_records(self, queue_job_ids: list[str], source_jobs: list[Job], raw_fingerprints: dict[str, tuple[str, str | None]]) -> list[dict]:
-        records = [{"job_id": job_id, "role": "queue_ack"} for job_id in queue_job_ids]
+    def _job_records(self, queue_job_ids: list[str], source_jobs: list[Job], raw_fingerprints: dict[str, tuple[str, str | None]]) -> list[PublicationJobRecord]:
+        records = [PublicationJobRecord(job_id=job_id, role="queue_ack") for job_id in queue_job_ids]
         for job in source_jobs:
             raw_path, raw_hash = raw_fingerprints.get(job.id, (job.input_artifact, None))
-            records.append({"job_id": job.id, "role": "source", "expected_content_hash": job.content_hash, "raw_path": raw_path, "raw_hash": raw_hash})
+            records.append(PublicationJobRecord(job_id=job.id, role="source", expected_content_hash=job.content_hash, raw_path=raw_path, raw_hash=raw_hash))
         return records
 
-    def _validate_candidate_manifest(self, batch_id: str, workspace: Path, manifest: dict, entries: list[dict]) -> None:
-        if manifest.get("batch_id") != batch_id or manifest.get("entries") != entries:
+    def _validate_candidate_manifest(self, batch_id: str, workspace: Path, manifest: dict, entries: list[PublicationEntry]) -> None:
+        if manifest.get("batch_id") != batch_id or manifest.get("entries") != [self._entry_manifest(entry) for entry in entries]:
             raise PublicationError("manifest_invalid", "candidate manifest does not match the validated candidate")
         for entry in entries:
-            if entry["operation"] != "write":
+            if entry.operation != "write":
                 continue
-            payload = workspace / "candidate" / entry["path"]
-            self._assert_under(payload, workspace / "candidate", "candidate payload")
-            if not payload.is_file() or self._sha256_file(payload) != entry["candidate_hash"]:
-                raise PublicationError("manifest_invalid", f"candidate payload does not match its fingerprint: {entry['path']}")
+            payload = workspace / "candidate" / entry.relative_path
+            self._assert_external_path_safe(payload, workspace / "candidate", "candidate payload")
+            if not payload.is_file() or self._sha256_file(payload) != entry.candidate_hash:
+                raise PublicationError("manifest_invalid", f"candidate payload does not match its fingerprint: {entry.relative_path}")
+
+    @staticmethod
+    def _entry_manifest(entry: PublicationEntry) -> dict:
+        return {"path": entry.relative_path, "operation": entry.operation, "candidate_hash": entry.candidate_hash}
+
+    @staticmethod
+    def _snapshot_manifest(entry: PublicationSnapshotEntry) -> dict:
+        return {"path": entry.relative_path, "exists": entry.existed, "hash": entry.content_hash}
+
+    @staticmethod
+    def _manifest_entries(manifest: dict) -> list[PublicationEntry]:
+        try:
+            values = manifest["entries"]
+            entries = [PublicationEntry(relative_path=item["path"], operation=item["operation"], candidate_hash=item.get("candidate_hash")) for item in values]
+        except (KeyError, TypeError) as exc:
+            raise PublicationError("manifest_invalid", "candidate manifest entries are malformed") from exc
+        if any(entry.operation not in {"write", "delete"} for entry in entries):
+            raise PublicationError("manifest_invalid", "candidate manifest contains an unknown operation")
+        return entries
+
+    @staticmethod
+    def _snapshot_entries(manifest: dict) -> list[PublicationSnapshotEntry]:
+        try:
+            values = manifest["entries"]
+            entries = [PublicationSnapshotEntry(relative_path=item["path"], existed=item["exists"], content_hash=item.get("hash")) for item in values]
+        except (KeyError, TypeError) as exc:
+            raise PublicationError("snapshot_invalid", "rollback snapshot entries are malformed") from exc
+        if any(not isinstance(entry.existed, bool) for entry in entries):
+            raise PublicationError("snapshot_invalid", "rollback snapshot contains an invalid existence marker")
+        return entries
+
+    def _journal(self, batch_id: str) -> PublicationJournal:
+        journal = self.state.publication(batch_id)
+        if journal is None:
+            raise PublicationError("publication_journal_missing", f"publication journal disappeared: {batch_id}")
+        return journal
 
     def _validate_path(self, relative: str, queue_path: str | None) -> None:
         if not relative or "\x00" in relative or "\\" in relative:
@@ -408,6 +479,22 @@ class BatchPublication:
             path.resolve(strict=False).relative_to(root.resolve())
         except ValueError as exc:
             raise PublicationError("path_escape", f"{label} escapes its configured root: {path}") from exc
+
+    @staticmethod
+    def _assert_external_path_safe(path: Path, root: Path, label: str) -> None:
+        if ".." in path.parts:
+            raise PublicationError("path_escape", f"{label} escapes its configured root: {path}")
+        root_absolute = Path(os.path.abspath(root))
+        path_absolute = Path(os.path.abspath(path))
+        try:
+            relative = path_absolute.relative_to(root_absolute)
+        except ValueError as exc:
+            raise PublicationError("path_escape", f"{label} escapes its configured root: {path}") from exc
+        current = root_absolute
+        for part in relative.parts:
+            current /= part
+            if current.is_symlink():
+                raise PublicationError("symlink_escape", f"{label} traverses a symlink: {current}")
 
     def _assert_parent_safe(self, target: Path) -> None:
         root = self.config.vault.resolve()
@@ -480,8 +567,13 @@ class BatchPublication:
         workspace = self.root / batch_id
         if not workspace.exists():
             return
-        shutil.rmtree(workspace / "candidate", ignore_errors=True)
-        shutil.rmtree(workspace / "rollback" / "payload", ignore_errors=True)
+        candidate = workspace / "candidate"
+        rollback_payload = workspace / "rollback" / "payload"
+        self._assert_external_path_safe(workspace, self.root, "candidate workspace")
+        self._assert_external_path_safe(candidate, workspace, "candidate payload")
+        self._assert_external_path_safe(rollback_payload, workspace / "rollback", "rollback payload")
+        shutil.rmtree(candidate, ignore_errors=True)
+        shutil.rmtree(rollback_payload, ignore_errors=True)
 
     def _fault(self, event: str, **details: Any) -> None:
         self.faults.hit(event, **details)

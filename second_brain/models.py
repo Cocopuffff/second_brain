@@ -2,11 +2,60 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
 
 SourceKind = Literal["article", "youtube"]
+PublicationOperation = Literal["write", "delete"]
+PublicationJobRole = Literal["source", "queue_ack"]
+
+
+class PublicationPhase(StrEnum):
+    CANDIDATE_VALIDATED = "candidate_validated"
+    ROLLBACK_SNAPSHOT_RECORDED = "rollback_snapshot_recorded"
+    PUBLISHING = "publishing"
+    PUBLISHED_UNCOMMITTED = "published_uncommitted"
+    COMMITTED_UNFINALIZED = "committed_unfinalized"
+    FINALIZED = "finalized"
+    CLEANUP_PENDING = "cleanup_pending"
+    COMPLETE = "complete"
+    ROLLED_BACK = "rolled_back"
+    RECOVERY_BLOCKED = "recovery_blocked"
+
+
+UNRESOLVED_PUBLICATION_PHASES = frozenset({
+    PublicationPhase.CANDIDATE_VALIDATED,
+    PublicationPhase.ROLLBACK_SNAPSHOT_RECORDED,
+    PublicationPhase.PUBLISHING,
+    PublicationPhase.PUBLISHED_UNCOMMITTED,
+    PublicationPhase.COMMITTED_UNFINALIZED,
+    PublicationPhase.RECOVERY_BLOCKED,
+})
+UNCOMMITTED_PUBLICATION_PHASES = frozenset({
+    PublicationPhase.ROLLBACK_SNAPSHOT_RECORDED,
+    PublicationPhase.PUBLISHING,
+    PublicationPhase.PUBLISHED_UNCOMMITTED,
+})
+CLEANUP_PUBLICATION_PHASES = frozenset({PublicationPhase.FINALIZED, PublicationPhase.CLEANUP_PENDING})
+COMMITTED_PUBLICATION_PHASES = frozenset({PublicationPhase.FINALIZED, PublicationPhase.CLEANUP_PENDING, PublicationPhase.COMPLETE})
+PUBLICATION_TRANSITIONS = {
+    PublicationPhase.CANDIDATE_VALIDATED: frozenset({PublicationPhase.ROLLBACK_SNAPSHOT_RECORDED, PublicationPhase.ROLLED_BACK, PublicationPhase.RECOVERY_BLOCKED}),
+    PublicationPhase.ROLLBACK_SNAPSHOT_RECORDED: frozenset({PublicationPhase.PUBLISHING, PublicationPhase.ROLLED_BACK, PublicationPhase.RECOVERY_BLOCKED}),
+    PublicationPhase.PUBLISHING: frozenset({PublicationPhase.PUBLISHED_UNCOMMITTED, PublicationPhase.COMMITTED_UNFINALIZED, PublicationPhase.ROLLED_BACK, PublicationPhase.RECOVERY_BLOCKED}),
+    PublicationPhase.PUBLISHED_UNCOMMITTED: frozenset({PublicationPhase.COMMITTED_UNFINALIZED, PublicationPhase.ROLLED_BACK, PublicationPhase.RECOVERY_BLOCKED}),
+    PublicationPhase.COMMITTED_UNFINALIZED: frozenset({PublicationPhase.FINALIZED, PublicationPhase.RECOVERY_BLOCKED}),
+    PublicationPhase.FINALIZED: frozenset({PublicationPhase.CLEANUP_PENDING, PublicationPhase.COMPLETE}),
+    PublicationPhase.CLEANUP_PENDING: frozenset({PublicationPhase.COMPLETE}),
+    PublicationPhase.COMPLETE: frozenset(),
+    PublicationPhase.ROLLED_BACK: frozenset(),
+    PublicationPhase.RECOVERY_BLOCKED: frozenset({PublicationPhase.COMMITTED_UNFINALIZED, PublicationPhase.ROLLED_BACK}),
+}
+
+
+def publication_transition_allowed(current: PublicationPhase, target: PublicationPhase) -> bool:
+    return current == target or target in PUBLICATION_TRANSITIONS[current]
 
 
 def utc_now() -> str:
@@ -32,6 +81,47 @@ class Job:
     queue_acknowledged: bool = False
     cleanup_pending: bool = False
     commit_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PublicationJournal:
+    batch_id: str
+    phase: PublicationPhase
+    candidate_workspace: str
+    candidate_manifest_hash: str
+    snapshot_workspace: str | None
+    snapshot_manifest_hash: str | None
+    base_commit: str
+    commit_id: str | None
+    blocked_from_phase: PublicationPhase | None
+    recovery_action: str | None
+    failure_code: str | None
+    failure_message: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class PublicationEntry:
+    relative_path: str
+    operation: PublicationOperation
+    candidate_hash: str | None
+
+
+@dataclass(frozen=True)
+class PublicationJobRecord:
+    job_id: str
+    role: PublicationJobRole
+    expected_content_hash: str | None = None
+    raw_path: str | None = None
+    raw_hash: str | None = None
+
+
+@dataclass(frozen=True)
+class PublicationSnapshotEntry:
+    relative_path: str
+    existed: bool
+    content_hash: str | None
 
 
 @dataclass(frozen=True)
@@ -95,7 +185,7 @@ class BatchReport:
     committed: bool
     commit_id: str | None
     failures: tuple[str, ...] = ()
-    publication_phase: str | None = None
+    publication_phase: PublicationPhase | None = None
     recovery_action: str | None = None
     recovery_block_reason: str | None = None
     publication_failure_code: str | None = None

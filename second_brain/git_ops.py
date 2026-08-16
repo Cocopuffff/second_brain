@@ -65,13 +65,18 @@ class GitRepository:
         fields = result.stdout.split("\x00")
         for index in range(0, len(fields) - 1, 2):
             commit_id, body = fields[index], fields[index + 1]
-            if commit_id and f"Batch-ID: {batch_id}" in body:
+            if commit_id and self._has_batch_trailer(body, batch_id):
                 matches.append(commit_id)
         if len(set(matches)) > 1:
             raise GitError(f"multiple commits claim batch {batch_id}")
         return matches[0] if matches else None
 
-    def verify_commit(self, commit_id: str, paths: list[str], candidate_hashes: dict[str, str | None], base_commit: str) -> bool:
+    def verify_commit(self, commit_id: str, paths: list[str], candidate_hashes: dict[str, str | None], base_commit: str, batch_id: str) -> bool:
+        if self.head() != commit_id:
+            return False
+        body = self._run("show", "-s", "--format=%B", commit_id).stdout
+        if not self._has_batch_trailer(body, batch_id):
+            return False
         parents = self._run("rev-list", "--parents", "-n", "1", commit_id).stdout.strip().split()
         if len(parents) != 2 or parents[1] != base_commit:
             return False
@@ -87,6 +92,10 @@ class GitRepository:
             if not exists or hashlib.sha256(self._run_bytes("show", f"{commit_id}:{path}")).hexdigest() != expected_hash:
                 return False
         return True
+
+    @staticmethod
+    def _has_batch_trailer(body: str, batch_id: str) -> bool:
+        return f"Batch-ID: {batch_id}" in {line.strip() for line in body.splitlines()}
 
     @staticmethod
     def _status_path(value: str) -> str:

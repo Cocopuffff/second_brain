@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 from .batch import BatchError, BatchRunner
 from .config import Config
 from .git_ops import GitError, GitRepository
+from .models import PublicationPhase, UNCOMMITTED_PUBLICATION_PHASES
 from .state import StateStore
 from .synthesis import CodexHarnessSynthesizer, DeepSeekSynthesizer
 from .youtube import FixtureYouTubeClient
@@ -32,15 +34,16 @@ def _publication_statuses(config: Config, state: StateStore) -> list[dict]:
     publications: list[dict] = []
     try:
         for journal in state.list_publications():
-            effective = dict(journal)
-            if journal["phase"] in {"publishing", "published_uncommitted"}:
-                commit_id = journal.get("commit_id") or git.find_batch_commit(journal["batch_id"])
+            effective = asdict(journal)
+            effective["recovery_block_reason"] = (journal.failure_code or journal.failure_message) if journal.phase == PublicationPhase.RECOVERY_BLOCKED else None
+            if journal.phase in UNCOMMITTED_PUBLICATION_PHASES:
+                commit_id = journal.commit_id or git.find_batch_commit(journal.batch_id)
                 if commit_id:
-                    entries = state.publication_entries(journal["batch_id"])
-                    paths = [entry["relative_path"] for entry in entries]
-                    hashes = {entry["relative_path"]: entry["candidate_hash"] for entry in entries}
-                    if git.verify_commit(commit_id, paths, hashes, journal["base_commit"]):
-                        effective["phase"] = "committed_unfinalized"
+                    entries = state.publication_entries(journal.batch_id)
+                    paths = [entry.relative_path for entry in entries]
+                    hashes = {entry.relative_path: entry.candidate_hash for entry in entries}
+                    if git.verify_commit(commit_id, paths, hashes, journal.base_commit, journal.batch_id):
+                        effective["phase"] = PublicationPhase.COMMITTED_UNFINALIZED
                         effective["commit_id"] = commit_id
             publications.append(effective)
     except GitError as exc:

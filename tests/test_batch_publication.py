@@ -8,6 +8,7 @@ import pytest
 
 from second_brain.batch import BatchError, BatchRunner
 from second_brain.cli import main
+from second_brain.controlled_synthesis import ControlledSynthesis
 from second_brain.config import Config
 from second_brain.models import CandidateFile, ChangeSet
 from second_brain.publication import PublicationCrash
@@ -135,6 +136,35 @@ def test_synthesis_failure_prevents_publication(tmp_path: Path):
     assert raw.exists()
     assert not list((vault / "Sources").rglob("*.md"))
     assert not list((vault / "Concepts").rglob("*.md"))
+
+
+def test_controlled_outcome_reaches_publication_with_validated_metadata(tmp_path: Path):
+    vault, config = _vault(tmp_path)
+
+    controlled = ControlledSynthesis(
+        lambda _capabilities: {"writes": [{"path": "Concepts/controlled.md", "content": "# New\n"}], "metadata": {"model": "fixture"}},
+        executor={"kind": "fixture", "version": "1"},
+    )
+    report = BatchRunner(config, synthesizer=controlled, fetcher=lambda _: "<article><p>Evidence.</p></article>").run()
+
+    assert report.committed
+    workspace = _publication_workspace(config)
+    manifest = json.loads((workspace / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["synthesis"]["executor"]["kind"] == "fixture"
+    assert manifest["synthesis"]["executor"]["model"] == "fixture"
+
+
+def test_controlled_failure_returns_without_publication(tmp_path: Path):
+    vault, config = _vault(tmp_path)
+    controlled = ControlledSynthesis(
+        lambda _capabilities: {"writes": [{"path": "Sources/escape.md", "content": "bad\n"}]},
+        executor={"kind": "fixture", "version": "1"},
+    )
+    report = BatchRunner(config, synthesizer=controlled, fetcher=lambda _: "<article><p>Evidence.</p></article>").run()
+
+    assert not report.committed
+    assert any("out_of_scope_change" in failure for failure in report.failures)
+    assert not list((vault / "Sources").rglob("*.md"))
 
 
 def test_crash_during_publication_is_rolled_back_on_next_run(tmp_path: Path):

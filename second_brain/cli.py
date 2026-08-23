@@ -7,11 +7,12 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .batch import BatchError, BatchRunner
+from .controlled_synthesis import CodexWorkspaceAdapter, ControlledSynthesis
 from .config import Config
 from .git_ops import GitError, GitRepository
 from .models import PublicationPhase, UNCOMMITTED_PUBLICATION_PHASES
 from .state import StateStore
-from .synthesis import CodexHarnessSynthesizer, DeepSeekSynthesizer
+from .synthesis import DeepSeekSynthesizer, NoopSynthesizer
 from .youtube import FixtureYouTubeClient
 
 
@@ -21,11 +22,13 @@ def _config(args) -> Config:
 
 def _runner(config: Config) -> BatchRunner:
     if config.executor == "deepseek":
-        synthesizer = DeepSeekSynthesizer(api_key=None, base_url=config.deepseek_base_url, model=config.deepseek_model, timeout=config.request_timeout)
+        adapter = DeepSeekSynthesizer(api_key=None, base_url=config.deepseek_base_url, model=config.deepseek_model, timeout=config.request_timeout)
+        synthesizer = ControlledSynthesis(adapter, executor={"kind": "deepseek", "model": config.deepseek_model, "version": "1"})
     elif config.executor == "codex":
-        synthesizer = CodexHarnessSynthesizer(list(config.codex_command))
+        adapter = CodexWorkspaceAdapter(list(config.codex_command), timeout=config.request_timeout)
+        synthesizer = ControlledSynthesis(adapter, executor={"kind": "codex", "version": "1"})
     else:
-        synthesizer = None
+        synthesizer = ControlledSynthesis(NoopSynthesizer(), executor={"kind": "noop", "version": "1"})
     return BatchRunner(config, synthesizer=synthesizer)
 
 

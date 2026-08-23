@@ -7,7 +7,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 
 from .config import Config
 from .git_ops import GitError, GitRepository
@@ -95,7 +95,7 @@ class BatchPublication:
         self._compact(batch_id)
         return PublicationResult(batch_id, PublicationPhase.ROLLED_BACK, "rolled_back_uncommitted")
 
-    def publish(self, batch_id: str, files: dict[str, str], deletions: tuple[str, ...], *, queue_path: str | None, queue_job_ids: list[str], source_jobs: list[Job], raw_fingerprints: dict[str, tuple[str, str | None]] | None = None) -> PublicationResult:
+    def publish(self, batch_id: str, files: dict[str, str], deletions: tuple[str, ...], *, queue_path: str | None, queue_job_ids: list[str], source_jobs: list[Job], raw_fingerprints: dict[str, tuple[str, str | None]] | None = None, synthesis_metadata: Mapping[str, Any] | None = None) -> PublicationResult:
         entries = self._prepare_entries(files, deletions, queue_path)
         if not entries:
             raise PublicationError("empty_publication", "validated candidate has no changes")
@@ -105,6 +105,12 @@ class BatchPublication:
         self._assert_external_path_safe(payload, workspace, "candidate payload")
         payload.mkdir(parents=True, exist_ok=True)
         manifest = {"batch_id": batch_id, "entries": [self._entry_manifest(entry) for entry in entries]}
+        if synthesis_metadata is not None:
+            try:
+                json.dumps(synthesis_metadata, ensure_ascii=False, sort_keys=True)
+            except (TypeError, ValueError) as exc:
+                raise PublicationError("synthesis_metadata_invalid", "validated synthesis metadata is not serializable") from exc
+            manifest["synthesis"] = dict(synthesis_metadata)
         for entry in entries:
             self._materialize_entry(payload, entry, files)
         self._validate_candidate_manifest(batch_id, workspace, manifest, entries)

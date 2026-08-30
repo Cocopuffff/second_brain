@@ -10,7 +10,7 @@ from .config import Config
 from .extraction import ImageProcessor
 from .git_ops import GitError, GitRepository
 from .html_discovery import discover_html
-from .intake import build_source_intake, queue_path_for
+from .intake import SourceIntakeFailure, build_source_intake, queue_path_for
 from .models import BatchReport, COMMITTED_PUBLICATION_PHASES, ChangeSet, Job, PublicationPhase, SourceCandidate, PreparationFailure
 from .preparation import PreparationFaults, SourcePreparation, build_source_preparation
 from .publication import BatchPublication, PublicationCrash, PublicationError, PublicationFaults, PublicationResult
@@ -142,8 +142,8 @@ class BatchRunner:
         intake_batch = intake.collect(batch_id)
         claimed_count = intake_batch.claimed_count
         failures = [
-            f"{failure.original_locator}: {failure.safe_message}"
-            if failure.original_locator
+            f"{failure.source.original_locator}: {failure.safe_message}"
+            if isinstance(failure, SourceIntakeFailure)
             else failure.safe_message
             for failure in intake_batch.failures
         ]

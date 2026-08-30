@@ -4,12 +4,12 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Callable, Literal, Protocol
+from typing import Callable, Literal, Protocol, TypeAlias
 
 from .canonical import source_key
 from .config import Config
 from .html_discovery import discover_html, html_hash
-from .models import AcquiredArticle, AcquiredYouTube, Job, PublicationIntent, SourceKind, VideoInput
+from .models import AcquiredArticle, AcquiredYouTube, Job, PublicationIntent, SourceKind
 from .queue import read_article_queue
 from .state import StateStore
 from .youtube import YouTubeClient
@@ -26,15 +26,39 @@ class IntakeFailureCategory(StrEnum):
 
 
 @dataclass(frozen=True)
-class IntakeFailure:
+class GlobalIntakeFailure:
     category: IntakeFailureCategory
     safe_message: str
-    kind: SourceKind | None = None
-    source_key: str | None = None
-    original_locator: str | None = None
-    job_id: str | None = None
-    input_artifact: str | None = None
     retryable: bool = True
+
+
+@dataclass(frozen=True)
+class IntakeSource:
+    kind: SourceKind
+    source_key: str
+    original_locator: str
+    input_artifact: str | None = None
+
+
+@dataclass(frozen=True)
+class SourceDiscoveryFailure:
+    category: IntakeFailureCategory
+    safe_message: str
+    source: IntakeSource
+    retryable: bool = True
+
+
+@dataclass(frozen=True)
+class SourceIntakeFailure:
+    category: IntakeFailureCategory
+    safe_message: str
+    source: IntakeSource
+    job_id: str
+    retryable: bool = True
+
+
+IntakeFailure: TypeAlias = GlobalIntakeFailure | SourceIntakeFailure
+DiscoveryFailure: TypeAlias = GlobalIntakeFailure | SourceDiscoveryFailure
 
 
 @dataclass(frozen=True)
@@ -66,7 +90,7 @@ class YouTubeWorkDescriptor:
     source_key: str
     original_locator: str
     publication_intent: PublicationIntent
-    video: VideoInput
+    video_id: str
     kind: Literal["youtube"] = field(default="youtube", init=False)
 
 
@@ -74,7 +98,7 @@ WorkDescriptor = ArticleWorkDescriptor | YouTubeWorkDescriptor
 
 
 class IntakeAdapter(Protocol):
-    def discover(self) -> tuple[list[WorkDescriptor], list[IntakeFailure]]: ...
+    def discover(self) -> tuple[list[WorkDescriptor], list[DiscoveryFailure]]: ...
 
     def acquire(self, descriptor: WorkDescriptor, job: Job) -> AcquiredPayload: ...
 
@@ -85,7 +109,7 @@ class ArticleIntakeAdapter:
         self.fetcher = fetcher
         self.queue_path = queue_path_for(config)
 
-    def discover(self) -> tuple[list[WorkDescriptor], list[IntakeFailure]]:
+    def discover(self) -> tuple[list[WorkDescriptor], list[DiscoveryFailure]]:
         queue_inputs, queue_errors = read_article_queue(self.queue_path)
         html_files, html_errors = discover_html(self.config.to_ingest)
         html_by_key: dict[str, list[Path]] = defaultdict(list)
@@ -105,8 +129,8 @@ class ArticleIntakeAdapter:
                 ),
             )
 
-        failures = [
-            IntakeFailure(IntakeFailureCategory.DISCOVERY_FAILED, message)
+        failures: list[DiscoveryFailure] = [
+            GlobalIntakeFailure(IntakeFailureCategory.DISCOVERY_FAILED, message)
             for message in (*queue_errors, *html_errors)
         ]
         for key, paths in html_by_key.items():
@@ -114,13 +138,10 @@ class ArticleIntakeAdapter:
             hashes = {html_hash(path) for path in paths}
             if len(hashes) > 1:
                 failures.append(
-                    IntakeFailure(
+                    SourceDiscoveryFailure(
                         IntakeFailureCategory.CONFLICTING_PAYLOAD,
                         "multiple non-identical HTML files claim the same canonical URL",
-                        kind="article",
-                        source_key=key,
-                        original_locator=locator,
-                        input_artifact=str(paths[0]),
+                        IntakeSource("article", key, locator, str(paths[0])),
                     )
                 )
                 descriptors.pop(key, None)
@@ -157,20 +178,18 @@ class YouTubeIntakeAdapter:
         self.playlist = playlist
         self.client = client
 
-    def discover(self) -> tuple[list[WorkDescriptor], list[IntakeFailure]]:
+    def discover(self) -> tuple[list[WorkDescriptor], list[DiscoveryFailure]]:
         descriptors: dict[str, YouTubeWorkDescriptor] = {}
-        failures: list[IntakeFailure] = []
-        for video in self.client.list_playlist(self.playlist):
-            locator = f"https://www.youtube.com/watch?v={video.video_id}"
+        failures: list[DiscoveryFailure] = []
+        for item in self.client.list_playlist(self.playlist):
+            locator = f"https://www.youtube.com/watch?v={item.video_id}"
             key = source_key("youtube", locator)
-            if not video.playlist_item_id:
+            if not item.playlist_item_id:
                 failures.append(
-                    IntakeFailure(
+                    SourceDiscoveryFailure(
                         IntakeFailureCategory.INVALID_ACKNOWLEDGEMENT_INTENT,
                         "YouTube playlist item is missing its acknowledgement identifier",
-                        kind="youtube",
-                        source_key=key,
-                        original_locator=locator,
+                        IntakeSource("youtube", key, locator),
                         retryable=False,
                     )
                 )
@@ -180,8 +199,8 @@ class YouTubeIntakeAdapter:
                 YouTubeWorkDescriptor(
                     key,
                     locator,
-                    PublicationIntent(youtube_playlist_item_id=video.playlist_item_id),
-                    video,
+                    PublicationIntent(youtube_playlist_item_id=item.playlist_item_id),
+                    item.video_id,
                 ),
             )
         return list(descriptors.values()), failures
@@ -189,7 +208,8 @@ class YouTubeIntakeAdapter:
     def acquire(self, descriptor: WorkDescriptor, job: Job) -> AcquiredYouTube:
         if not isinstance(descriptor, YouTubeWorkDescriptor):
             raise TypeError("YouTube intake received a non-YouTube descriptor")
-        return AcquiredYouTube(descriptor.video, descriptor.publication_intent)
+        video = self.client.acquire_video(descriptor.video_id)
+        return AcquiredYouTube(video, descriptor.publication_intent)
 
 
 class SourceIntake:
@@ -207,22 +227,32 @@ class SourceIntake:
             try:
                 descriptors, discovery_failures = adapter.discover()
             except Exception as exc:
-                failures.append(IntakeFailure(IntakeFailureCategory.DISCOVERY_FAILED, str(exc)))
+                failures.append(GlobalIntakeFailure(IntakeFailureCategory.DISCOVERY_FAILED, str(exc)))
                 continue
-            failures.extend(discovery_failures)
             for failure in discovery_failures:
-                if failure.kind is None or failure.source_key is None or failure.original_locator is None:
+                if isinstance(failure, GlobalIntakeFailure):
+                    failures.append(failure)
                     continue
+                source = failure.source
                 job, owned = self.state.claim_exclusive(
-                    failure.kind,
-                    failure.source_key,
-                    failure.original_locator,
-                    input_artifact=failure.input_artifact,
+                    source.kind,
+                    source.source_key,
+                    source.original_locator,
+                    input_artifact=source.input_artifact,
                     batch_id=batch_id,
                 )
                 if owned:
                     claimed_count += 1
                     self.state.fail(job.id, failure.category.value, failure.safe_message, retryable=failure.retryable)
+                failures.append(
+                    SourceIntakeFailure(
+                        category=failure.category,
+                        safe_message=failure.safe_message,
+                        source=source,
+                        job_id=job.id,
+                        retryable=failure.retryable,
+                    )
+                )
             for descriptor in descriptors:
                 job, owned = self.state.claim_exclusive(
                     descriptor.kind,
@@ -240,12 +270,17 @@ class SourceIntake:
                 except Exception as exc:
                     self.state.fail(job.id, IntakeFailureCategory.ACQUISITION_FAILED.value, str(exc))
                     failures.append(
-                        IntakeFailure(
-                            IntakeFailureCategory.ACQUISITION_FAILED,
-                            str(exc),
-                            kind=descriptor.kind,
-                            source_key=descriptor.source_key,
-                            original_locator=descriptor.original_locator,
+                        SourceIntakeFailure(
+                            category=IntakeFailureCategory.ACQUISITION_FAILED,
+                            safe_message=str(exc),
+                            source=IntakeSource(
+                                descriptor.kind,
+                                descriptor.source_key,
+                                descriptor.original_locator,
+                                str(descriptor.html_path)
+                                if isinstance(descriptor, ArticleWorkDescriptor) and descriptor.html_path
+                                else None,
+                            ),
                             job_id=job.id,
                         )
                     )
@@ -292,11 +327,16 @@ def queue_path_for(config: Config) -> Path:
 __all__ = [
     "ArticleIntakeAdapter",
     "ArticleWorkDescriptor",
+    "DiscoveryFailure",
+    "GlobalIntakeFailure",
     "IntakeAdapter",
     "IntakeBatch",
     "IntakeFailure",
     "IntakeFailureCategory",
+    "IntakeSource",
     "IntakeSuccess",
+    "SourceIntakeFailure",
+    "SourceDiscoveryFailure",
     "SourceIntake",
     "WorkDescriptor",
     "YouTubeIntakeAdapter",

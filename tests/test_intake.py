@@ -7,10 +7,19 @@ import pytest
 
 from second_brain.config import Config
 from second_brain.batch import BatchRunner
-from second_brain.intake import IntakeFailureCategory, IntakeSuccess, build_source_intake
-from second_brain.models import AcquiredArticle, AcquiredYouTube, VideoInput
+from second_brain.intake import (
+    IntakeFailureCategory,
+    IntakeSuccess,
+    SourceIntakeFailure,
+    build_source_intake,
+)
+from second_brain.models import AcquiredArticle, AcquiredYouTube, TranscriptSegment, VideoInput
 from second_brain.state import StateStore
-from second_brain.youtube import FixtureYouTubeClient
+from second_brain.youtube import (
+    FixtureYouTubeClient,
+    YouTubeAcknowledgement,
+    YouTubePlaylistItem,
+)
 from second_brain.publication import PublicationCrash
 
 
@@ -73,6 +82,60 @@ def test_article_and_youtube_share_one_normalized_intake_contract(tmp_path: Path
 
     assert (vault / "To Ingest.md").read_bytes() == queue_before
     assert youtube.acknowledged == []
+
+
+class _ClaimAwareYouTubeClient:
+    def __init__(self, state: StateStore):
+        self.state = state
+        self.acquired: list[str] = []
+
+    def list_playlist(self, playlist: str) -> list[YouTubePlaylistItem]:
+        return [
+            YouTubePlaylistItem(
+                video_id="abcDEF12345",
+                playlist_item_id="playlist-item",
+            )
+        ]
+
+    def acquire_video(self, video_id: str) -> VideoInput:
+        job = self.state.find("youtube:https://www.youtube.com/watch?v=abcDEF12345")
+        if job is None or job.status != "claimed":
+            raise AssertionError("YouTube payload acquisition started before the exclusive claim")
+        self.acquired.append(video_id)
+        return VideoInput(
+            video_id=video_id,
+            title="Acquired video",
+            manual_transcript=(TranscriptSegment(12, 20, "Evidence"),),
+            playlist_item_id="playlist-item",
+        )
+
+    def acknowledge(self, playlist_item_id: str) -> YouTubeAcknowledgement:
+        return YouTubeAcknowledgement.REMOVED
+
+
+def test_youtube_payload_is_acquired_only_after_exclusive_claim(tmp_path: Path):
+    vault, config, _youtube = _fixture(tmp_path)
+    (vault / "To Ingest.md").write_text("", encoding="utf-8")
+    state = StateStore(config.database)
+    try:
+        batch_id = state.create_batch()
+        youtube = _ClaimAwareYouTubeClient(state)
+
+        result = build_source_intake(
+            config,
+            state,
+            fetcher=lambda _url: "",
+            youtube_client=youtube,
+        ).collect(batch_id)
+
+        assert result.failures == ()
+        assert youtube.acquired == ["abcDEF12345"]
+        assert len(result.successes) == 1
+        payload = result.successes[0].payload
+        assert isinstance(payload, AcquiredYouTube)
+        assert payload.video.manual_transcript == (TranscriptSegment(12, 20, "Evidence"),)
+    finally:
+        state.close()
 
 
 def test_claim_is_exclusive_then_recoverable_after_restart(tmp_path: Path):
@@ -245,6 +308,7 @@ def test_acquisition_failure_is_structured_and_preserves_inputs(tmp_path: Path):
         assert result.successes == ()
         assert len(result.failures) == 1
         failure = result.failures[0]
+        assert isinstance(failure, SourceIntakeFailure)
         assert failure.category == "acquisition_failed"
         assert failure.safe_message == "fixture HTTP failure"
         job = state.get(failure.job_id or "")
@@ -281,9 +345,15 @@ def test_youtube_without_playlist_item_id_is_a_structured_intake_failure(tmp_pat
 
         assert result.successes == ()
         assert len(result.failures) == 1
-        assert result.failures[0].category == IntakeFailureCategory.INVALID_ACKNOWLEDGEMENT_INTENT
+        failure = result.failures[0]
+        assert isinstance(failure, SourceIntakeFailure)
+        assert failure.category == IntakeFailureCategory.INVALID_ACKNOWLEDGEMENT_INTENT
+        assert failure.source.kind == "youtube"
+        assert failure.source.source_key == "youtube:https://www.youtube.com/watch?v=abcDEF12345"
+        assert failure.source.original_locator == "https://www.youtube.com/watch?v=abcDEF12345"
         job = state.find("youtube:https://www.youtube.com/watch?v=abcDEF12345")
         assert job is not None
+        assert failure.job_id == job.id
         assert job.status == "failed"
         assert job.failure_code == "invalid_acknowledgement_intent"
         with pytest.raises(ValueError, match="not retryable"):

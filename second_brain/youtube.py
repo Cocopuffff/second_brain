@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import Path
+from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import Protocol
 
 from .canonical import canonical_url, source_key, stable_id
@@ -16,8 +17,15 @@ class YouTubeAcknowledgement(StrEnum):
     ALREADY_ABSENT = "already_absent"
 
 
+@dataclass(frozen=True)
+class YouTubePlaylistItem:
+    video_id: str
+    playlist_item_id: str | None
+
+
 class YouTubeClient(Protocol):
-    def list_playlist(self, playlist: str) -> list[VideoInput]: ...
+    def list_playlist(self, playlist: str) -> list[YouTubePlaylistItem]: ...
+    def acquire_video(self, video_id: str) -> VideoInput: ...
     def acknowledge(self, playlist_item_id: str) -> YouTubeAcknowledgement: ...
 
 
@@ -31,11 +39,26 @@ class FixtureYouTubeClient:
         self.acknowledged: list[str] = []
         self.acknowledgement_attempts: list[str] = []
         self._removed: set[str] = set()
+        self._discovered: dict[str, dict] = {}
 
-    def list_playlist(self, playlist: str) -> list[VideoInput]:
+    def list_playlist(self, playlist: str) -> list[YouTubePlaylistItem]:
         data = json.loads(self.fixture.read_text(encoding="utf-8"))
         items = data.get(playlist, data if isinstance(data, list) else [])
-        return [_video(item) for item in items]
+        self._discovered.update((str(item["video_id"]), item) for item in items)
+        return [
+            YouTubePlaylistItem(
+                video_id=str(item["video_id"]),
+                playlist_item_id=item.get("playlist_item_id"),
+            )
+            for item in items
+        ]
+
+    def acquire_video(self, video_id: str) -> VideoInput:
+        try:
+            item = self._discovered[video_id]
+        except KeyError as exc:
+            raise TranscriptError(f"video was not discovered in the configured playlist: {video_id}") from exc
+        return _video(item)
 
     def acknowledge(self, playlist_item_id: str) -> YouTubeAcknowledgement:
         self.acknowledgement_attempts.append(playlist_item_id)

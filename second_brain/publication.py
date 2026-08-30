@@ -7,11 +7,12 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from .config import Config
 from .git_ops import GitError, GitRepository
-from .models import CLEANUP_PUBLICATION_PHASES, Job, PublicationEntry, PublicationJobRecord, PublicationJournal, PublicationPhase, PublicationSnapshotEntry
+from .models import CLEANUP_PUBLICATION_PHASES, Job, PublicationEntry, PublicationJobRecord, PublicationJournal, PublicationOperation, PublicationPhase, PublicationSnapshotEntry
+from .preparation import PreparationError
 from .state import StateStore
 
 
@@ -46,11 +47,12 @@ class PublicationResult:
 
 
 class BatchPublication:
-    def __init__(self, config: Config, state: StateStore, git: GitRepository, *, faults: PublicationFaults | None = None):
+    def __init__(self, config: Config, state: StateStore, git: GitRepository, *, faults: PublicationFaults | None = None, candidate_cleanup: Callable[[str], None] | None = None):
         self.config = config
         self.state = state
         self.git = git
         self.faults = faults or NoopFaults()
+        self.candidate_cleanup = candidate_cleanup
         self.root = config.state_dir / "publications"
 
     def recover_oldest(self) -> PublicationResult | None:
@@ -95,7 +97,7 @@ class BatchPublication:
         self._compact(batch_id)
         return PublicationResult(batch_id, PublicationPhase.ROLLED_BACK, "rolled_back_uncommitted")
 
-    def publish(self, batch_id: str, files: dict[str, str], deletions: tuple[str, ...], *, queue_path: str | None, queue_job_ids: list[str], source_jobs: list[Job], raw_fingerprints: dict[str, tuple[str, str | None]] | None = None, synthesis_metadata: Mapping[str, Any] | None = None) -> PublicationResult:
+    def publish(self, batch_id: str, files: Mapping[str, str | bytes], deletions: tuple[str, ...], *, queue_path: str | None, queue_job_ids: list[str], source_jobs: list[Job], raw_fingerprints: dict[str, tuple[str, str | None]] | None = None, synthesis_metadata: Mapping[str, Any] | None = None) -> PublicationResult:
         entries = self._prepare_entries(files, deletions, queue_path)
         if not entries:
             raise PublicationError("empty_publication", "validated candidate has no changes")
@@ -207,7 +209,11 @@ class BatchPublication:
     def _cleanup_journal(self, journal: PublicationJournal) -> int:
         batch_id = journal.batch_id
         jobs = self.state.publication_jobs(batch_id)
-        pending = [item for item in jobs if item.role == "source" and self.state.get(item.job_id) and self.state.get(item.job_id).cleanup_pending]
+        pending = []
+        for item in jobs:
+            job = self.state.get(item.job_id)
+            if item.role == "source" and job is not None and job.cleanup_pending:
+                pending.append(item)
         if pending:
             self.state.mark_publication_cleanup_pending(batch_id)
         cleaned = 0
@@ -224,11 +230,15 @@ class BatchPublication:
                         path.unlink()
                         self._fsync_dir(path.parent)
                         self._fault("raw_payload_removed", batch_id=batch_id, job_id=item.job_id)
+                if self.candidate_cleanup is not None:
+                    self.candidate_cleanup(item.job_id)
                 self.state.mark_cleanup_done(item.job_id)
                 self._fault("cleanup_marked", batch_id=batch_id, job_id=item.job_id)
                 cleaned += 1
             except PublicationError as exc:
                 self.state.update_publication(batch_id, PublicationPhase.CLEANUP_PENDING, action="cleanup_pending", failure_code=exc.code, failure_message=exc.message)
+            except PreparationError as exc:
+                self.state.update_publication(batch_id, PublicationPhase.CLEANUP_PENDING, action="cleanup_pending", failure_code=exc.code.value, failure_message=exc.message)
             except OSError as exc:
                 self.state.update_publication(batch_id, PublicationPhase.CLEANUP_PENDING, action="cleanup_pending", failure_code="cleanup_failed", failure_message=str(exc))
         remaining = [
@@ -243,13 +253,13 @@ class BatchPublication:
             self._compact(batch_id)
         return cleaned
 
-    def _prepare_entries(self, files: dict[str, str], deletions: tuple[str, ...], queue_path: str | None) -> list[PublicationEntry]:
-        operations: dict[str, tuple[str, str | None]] = {}
+    def _prepare_entries(self, files: Mapping[str, str | bytes], deletions: tuple[str, ...], queue_path: str | None) -> list[PublicationEntry]:
+        operations: dict[str, tuple[PublicationOperation, str | None]] = {}
         for path, content in files.items():
             self._validate_path(path, queue_path)
             if path in operations:
                 raise PublicationError("duplicate_candidate_path", f"duplicate candidate path: {path}")
-            operations[path] = ("write", hashlib.sha256(content.encode("utf-8")).hexdigest())
+            operations[path] = ("write", self._content_hash(content))
         for path in deletions:
             self._validate_path(path, queue_path)
             if not (path.startswith("Concepts/") or path.startswith("Sources/")):
@@ -297,13 +307,14 @@ class BatchPublication:
         self._write_json(manifest_path, manifest)
         return {"hash": self._sha256_json(manifest), "entries": snapshot_entries}
 
-    def _materialize_entry(self, payload: Path, entry: PublicationEntry, files: dict[str, str]) -> None:
+    def _materialize_entry(self, payload: Path, entry: PublicationEntry, files: Mapping[str, str | bytes]) -> None:
         if entry.operation != "write":
             return
         destination = payload / entry.relative_path
         self._assert_external_path_safe(destination, payload, "candidate payload")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        self._atomic_replace_bytes(destination, files[entry.relative_path].encode("utf-8"), f".{destination.name}.candidate.")
+        content = files[entry.relative_path]
+        self._atomic_replace_bytes(destination, content if isinstance(content, bytes) else content.encode("utf-8"), f".{destination.name}.candidate.")
 
     def _publish_entry(self, entry: PublicationEntry, payload: Path) -> None:
         target = self._live_path(entry.relative_path)
@@ -522,6 +533,10 @@ class BatchPublication:
     @staticmethod
     def _sha256_file(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    @staticmethod
+    def _content_hash(content: str | bytes) -> str:
+        return hashlib.sha256(content if isinstance(content, bytes) else content.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _sha256_json(value: dict) -> str:

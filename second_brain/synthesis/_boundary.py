@@ -15,11 +15,15 @@ import subprocess
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol, Sequence, cast
 from urllib.parse import parse_qs, unquote, urlparse
 
-from ..models import CandidateFile, ChangeSet, SourceDocument
+from ..models import ArticleEvidenceBounds, CandidateFile, ChangeSet, SourceCandidate, SourceDocument, YouTubeEvidenceBounds
+from ..provenance import timestamp_seconds, transcript_time_bounds
 from ..render import render_markdown
+
+
+SourceLike = SourceDocument | SourceCandidate
 
 
 FAILURE_CATEGORIES = frozenset({
@@ -79,7 +83,7 @@ class NarrowReadCapabilities:
     list_concepts: Callable[[], tuple[ConceptDescriptor, ...]]
     read_concept: Callable[[str], str]
     search_concepts: Callable[[str], tuple[ConceptDescriptor, ...]]
-    read_source: Callable[[str], SourceDocument]
+    read_source: Callable[[str], SourceLike]
 
 
 class DirectAdapter(Protocol):
@@ -149,7 +153,7 @@ def _candidate_path(relative: str, workspace: Path) -> tuple[str, Path]:
     return normalized, target
 
 
-def _source_version_key(source: SourceDocument) -> str:
+def _source_version_key(source: SourceLike) -> str:
     return f"{source.source_id}:v{source.source_version}"
 
 
@@ -239,7 +243,7 @@ class ControlledSynthesis:
         self.max_search_results = max_search_results
         self.max_read_bytes = max_read_bytes
 
-    def run(self, batch_sources: list[SourceDocument], concept_catalog: Mapping[str, Any], workspace: Path, *, vault: Path | None = None, committed_sources: list[SourceDocument] = ()) -> SynthesisOutcome | SynthesisFailure:
+    def run(self, batch_sources: Sequence[SourceLike], concept_catalog: Mapping[str, Any], workspace: Path, *, vault: Path | None = None, committed_sources: Sequence[SourceLike] = ()) -> SynthesisOutcome | SynthesisFailure:
         try:
             workspace.mkdir(parents=True, exist_ok=True)
             if isinstance(self.adapter, CodexWorkspaceAdapter):
@@ -248,7 +252,7 @@ class ControlledSynthesis:
                 self.adapter.seed_workspace(concept_catalog, workspace, batch_sources=batch_sources)
                 self.adapter.prepare_context(batch_sources, concept_catalog, workspace, vault)
             workspace_before = _regular_tree(workspace)
-            sources: dict[str, SourceDocument] = {}
+            sources: dict[str, SourceLike] = {}
             for source in [*batch_sources, *committed_sources]:
                 # Provenance is immutable and version-specific.  Do not add
                 # source-id or physical-path aliases that could silently pick
@@ -272,7 +276,7 @@ class ControlledSynthesis:
             else:
                 self.adapter.set_source_versions(tuple(sorted(sources)))
                 raw = self.adapter.execute(capabilities)
-            result = _strict_adapter_result(raw)
+            result = _strict_adapter_result(cast(AdapterResult | Mapping[str, Any], raw))
             if isinstance(self.adapter, CodexWorkspaceAdapter):
                 result = self._codex_result(result, workspace, workspace_before, vault)
             return self._validate(result, sources, concepts, workspace, vault)
@@ -519,6 +523,9 @@ class CodexWorkspaceAdapter:
         except (OSError, subprocess.SubprocessError) as exc:
             raise SynthesisValidationError("adapter_execution_failure", "Codex adapter execution failed") from exc
         metadata: dict[str, Any] = {}
+        parsed: AdapterResult | None = None
+        writes: tuple[CandidateFile, ...] = ()
+        deletions: tuple[str, ...] = ()
         if process.stdout.strip():
             try:
                 decoded = json.loads(process.stdout)
@@ -526,12 +533,14 @@ class CodexWorkspaceAdapter:
                 raise SynthesisValidationError("malformed_executor_output", "Codex stdout is not JSON") from exc
             parsed = _strict_adapter_result(decoded)
             metadata = dict(parsed.metadata)
+            writes = parsed.writes
+            deletions = parsed.deletions
             provenance = parsed.provenance
             claims_present = parsed.claims_present
         else:
             provenance = []
             claims_present = False
-        return AdapterResult(tuple(parsed.writes) if process.stdout.strip() else (), tuple(parsed.deletions) if process.stdout.strip() else (), tuple(provenance), {"kind": "codex", "version": self.executor_version, **metadata}, claims_present)
+        return AdapterResult(writes, deletions, tuple(provenance), {"kind": "codex", "version": self.executor_version, **metadata}, claims_present)
 
     def _invocation(self, workspace: Path) -> list[str]:
         schema = workspace / ".synthesis-output-schema.json"
@@ -599,7 +608,7 @@ def _citation_links(content: str) -> list[tuple[str, str]]:
     return re.findall(r"\[([^\]]+)\]\((obsidian://[^)]+|https?://(?:www\.)?youtube\.com/[^)]+)\)", content)
 
 
-def _citation_matches(link: tuple[str, str], source: SourceDocument) -> bool:
+def _citation_matches(link: tuple[str, str], source: SourceLike) -> bool:
     label, uri = link
     parsed = urlparse(uri)
     if source.kind == "article":
@@ -610,22 +619,22 @@ def _citation_matches(link: tuple[str, str], source: SourceDocument) -> bool:
         if not match or not line.isdigit():
             return False
         start, end = map(int, match.groups())
-        return filepath == source.relative_path and start >= 1 and end >= start and end <= len(render_markdown(source).splitlines()) and int(line) == start
+        upper = source.evidence_bounds.last_line if isinstance(source, SourceCandidate) and isinstance(source.evidence_bounds, ArticleEvidenceBounds) else len(render_markdown(source.source if isinstance(source, SourceCandidate) else source).splitlines())
+        return filepath == source.relative_path and start >= 1 and end >= start and end <= upper and int(line) == start
     query = parse_qs(parsed.query)
     video = query.get("v", [""])[0]
     start = query.get("t", [""])[0].rstrip("s")
     match = re.search(r"·\s*(\d+:\d{2}(?::\d{2})?)–(\d+:\d{2}(?::\d{2})?)$", label)
     if not match or not start.isdigit() or not video:
         return False
-    def seconds(value: str) -> int:
-        parts = [int(part) for part in value.split(":")]
-        return parts[-1] + (parts[-2] * 60 if len(parts) > 1 else 0) + (parts[-3] * 3600 if len(parts) > 2 else 0)
-    begin, end = (seconds(value) for value in match.groups())
-    transcript_times = [seconds(item) for item in re.findall(r"^###\s+(\d+:\d{2}(?::\d{2})?)–", source.content, re.MULTILINE)]
-    transcript_ends = [seconds(item) for item in re.findall(r"^###\s+\d+:\d{2}(?::\d{2})?–(\d+:\d{2}(?::\d{2})?)", source.content, re.MULTILINE)]
-    upper = max(transcript_ends or transcript_times or [0])
+    begin, end = (timestamp_seconds(value) for value in match.groups())
+    if isinstance(source, SourceCandidate) and isinstance(source.evidence_bounds, YouTubeEvidenceBounds):
+        lower, upper = source.evidence_bounds.first_second, source.evidence_bounds.last_second
+    else:
+        bounds = transcript_time_bounds(source.content)
+        lower, upper = bounds if bounds is not None else (0, 0)
     canonical_video = parse_qs(urlparse(source.canonical_url).query).get("v", [""])[0]
-    return video == canonical_video and begin >= 0 and end >= begin and end <= upper and int(start) == begin
+    return video == canonical_video and begin >= lower and end >= begin and end <= upper and int(start) == begin
 
 
 def validate_adapter_result(adapter_result: AdapterResult | Mapping[str, Any]) -> AdapterResult:

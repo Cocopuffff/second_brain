@@ -12,7 +12,7 @@ import unicodedata
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, cast
 
 from ._boundary import (
     AdapterResult,
@@ -25,7 +25,7 @@ from ._boundary import (
     _source_version_key,
 )
 from .adapters import DeepSeekAdapter, NoopAdapter
-from ..models import ChangeSet, SourceDocument
+from ..models import ChangeSet, SourceCandidate, SourceDocument, SourceKind
 from ..render import render_markdown, render_source
 
 __all__ = [
@@ -185,6 +185,7 @@ def _committed_sources(vault: Path) -> list[SourceDocument]:
         if not text.startswith("---\n") or "\n---\n" not in text:
             raise ValueError(f"committed source has invalid frontmatter: {path}")
         header, rendered_body = text[4:].split("\n---\n", 1)
+        rendered_body = rendered_body.removeprefix("\n")
         metadata: dict[str, object] = {}
         for line in header.splitlines():
             if ":" not in line:
@@ -196,13 +197,23 @@ def _committed_sources(vault: Path) -> list[SourceDocument]:
         if not rendered_body.startswith(marker):
             raise ValueError(f"committed source body does not match title: {path}")
         content = rendered_body[len(marker):]
-        kind = str(metadata.get("source_type", ""))
+        kind_value = str(metadata.get("source_type", ""))
+        if kind_value not in {"article", "youtube"}:
+            raise ValueError(f"committed source has invalid kind: {path}")
+        kind = cast(SourceKind, kind_value)
+        author_value = metadata.get("author")
+        author = author_value if isinstance(author_value, str) else None
+        publication_value = metadata.get("publication_date")
+        publication_date = publication_value if isinstance(publication_value, str) else None
+        version_value = metadata.get("immutable_source_version")
+        if not isinstance(version_value, (int, str)):
+            raise ValueError(f"committed source has invalid version: {path}")
         source = render_source(
             source_id=str(metadata["source_id"]), kind=kind,
             canonical_url=str(metadata["canonical_url"]), title=title, body=content,
-            author=metadata.get("author"), publication_date=metadata.get("publication_date"),
+            author=author, publication_date=publication_date,
             captured_at=str(metadata["captured_at"]), input_method=str(metadata["input_method"]),
-            source_version=int(metadata["immutable_source_version"]),
+            source_version=int(version_value),
         )
         if source.relative_path != path.relative_to(vault).as_posix() or source.content_hash != str(metadata["content_hash"]) or render_markdown(source) != text:
             raise ValueError(f"committed source identity or rendering mismatch: {path}")
@@ -219,7 +230,7 @@ class SynthesisRunner:
         self.executor = executor
         self._boundary = ControlledSynthesis(adapter, executor=executor.as_dict())
 
-    def run(self, batch_id: str, batch_sources: Sequence[SourceDocument]) -> SynthesisOutcome | SynthesisFailure:
+    def run(self, batch_id: str, batch_sources: Sequence[SourceCandidate]) -> SynthesisOutcome | SynthesisFailure:
         workspace = self.config.state_dir / "staging" / batch_id
         try:
             catalog = _catalog(self.config.vault)

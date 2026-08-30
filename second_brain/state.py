@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from .models import Job, PublicationEntry, PublicationJobRecord, PublicationJournal, PublicationPhase, UNRESOLVED_PUBLICATION_PHASES, publication_transition_allowed, utc_now
+from .models import Job, PublicationEntry, PublicationJobRecord, PublicationJournal, PublicationPhase, SourceCandidateLifecycle, SourceCandidateRecord, UNRESOLVED_PUBLICATION_PHASES, publication_transition_allowed, utc_now
 
 
 SCHEMA = """
@@ -76,6 +76,20 @@ CREATE TABLE IF NOT EXISTS publication_jobs (
   PRIMARY KEY (batch_id, job_id, role)
 );
 CREATE INDEX IF NOT EXISTS publication_phase_idx ON publication_journals(phase, created_at);
+CREATE TABLE IF NOT EXISTS source_candidates (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+  source_identity TEXT NOT NULL UNIQUE,
+  source_version INTEGER NOT NULL,
+  relative_path TEXT NOT NULL UNIQUE,
+  artifact_path TEXT NOT NULL,
+  manifest_path TEXT NOT NULL,
+  manifest_hash TEXT NOT NULL,
+  rendered_hash TEXT NOT NULL,
+  lifecycle TEXT NOT NULL CHECK (lifecycle IN ('prepared', 'payload_removed')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS source_candidates_path_idx ON source_candidates(relative_path);
 """
 
 
@@ -142,6 +156,96 @@ class StateStore:
     def list_publications(self) -> list[PublicationJournal]:
         return [self._publication_journal(row) for row in self.connection.execute("SELECT * FROM publication_journals ORDER BY created_at DESC, batch_id DESC")]
 
+    def source_candidate(self, job_id: str) -> SourceCandidateRecord | None:
+        row = self.connection.execute("SELECT * FROM source_candidates WHERE job_id=?", (job_id,)).fetchone()
+        return self._source_candidate(row) if row else None
+
+    def source_candidates_for_batch(self, batch_id: str) -> list[SourceCandidateRecord]:
+        return [
+            self._source_candidate(row)
+            for row in self.connection.execute(
+                """SELECT c.* FROM source_candidates c
+                   JOIN jobs j ON j.id=c.job_id
+                   WHERE j.batch_id=? AND j.status='source_ready'
+                   ORDER BY j.created_at, j.id""",
+                (batch_id,),
+            )
+        ]
+
+    def source_ready_jobs(self) -> list[Job]:
+        jobs = [
+            self._job(row)
+            for row in self.connection.execute(
+                """SELECT j.* FROM jobs j
+                   LEFT JOIN batches b ON b.id=j.batch_id
+                   WHERE j.status='source_ready'
+                   ORDER BY COALESCE(b.created_at, j.updated_at), j.updated_at, j.id"""
+            )
+        ]
+        if not jobs:
+            return []
+        oldest_batch = jobs[0].batch_id
+        return [job for job in jobs if job.batch_id == oldest_batch]
+
+    def rebind_source_ready(self, job_ids: list[str], batch_id: str) -> None:
+        if not job_ids:
+            return
+        with self.transaction() as db:
+            for job_id in job_ids:
+                row = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if not row or row["status"] != "source_ready":
+                    raise ValueError(f"job {job_id} is not source_ready")
+                db.execute("UPDATE jobs SET batch_id=?, updated_at=? WHERE id=?", (batch_id, utc_now(), job_id))
+
+    def source_versions(self, source_id: str) -> list[int]:
+        prefix = f"{source_id}:v%"
+        return [int(row["source_version"]) for row in self.connection.execute("SELECT source_version FROM source_candidates WHERE source_identity LIKE ?", (prefix,))]
+
+    def write_source_candidate(
+        self,
+        job_id: str,
+        *,
+        source_identity: str,
+        source_version: int,
+        relative_path: str,
+        artifact_path: str,
+        manifest_path: str,
+        manifest_hash: str,
+        rendered_hash: str,
+        content_hash: str,
+    ) -> None:
+        now = utc_now()
+        with self.transaction() as db:
+            job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not job:
+                raise KeyError(job_id)
+            existing = db.execute("SELECT * FROM source_candidates WHERE job_id=?", (job_id,)).fetchone()
+            values = (source_identity, source_version, relative_path, artifact_path, manifest_path, manifest_hash, rendered_hash)
+            if existing:
+                current = tuple(existing[key] for key in ("source_identity", "source_version", "relative_path", "artifact_path", "manifest_path", "manifest_hash", "rendered_hash"))
+                if current != values:
+                    raise ValueError(f"source candidate for job {job_id} does not match the persisted identity")
+                db.execute("UPDATE source_candidates SET lifecycle=?, updated_at=? WHERE job_id=?", (SourceCandidateLifecycle.PREPARED.value, now, job_id))
+            else:
+                try:
+                    db.execute(
+                        """INSERT INTO source_candidates
+                           (job_id, source_identity, source_version, relative_path, artifact_path, manifest_path, manifest_hash, rendered_hash, lifecycle, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?)""",
+                        (job_id, source_identity, source_version, relative_path, artifact_path, manifest_path, manifest_hash, rendered_hash, now, now),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise ValueError("source candidate identity or path already exists") from exc
+            db.execute(
+                """UPDATE jobs SET status='source_ready', retryable=0, failure_code=NULL, failure_message=NULL,
+                   content_hash=?, source_version=?, cleanup_pending=0, updated_at=? WHERE id=?""",
+                (content_hash, source_version, now, job_id),
+            )
+
+    def mark_source_candidate_payload_removed(self, job_id: str) -> None:
+        with self.transaction() as db:
+            db.execute("UPDATE source_candidates SET lifecycle=?, updated_at=? WHERE job_id=?", (SourceCandidateLifecycle.PAYLOAD_REMOVED.value, utc_now(), job_id))
+
     def update_publication(self, batch_id: str, phase: PublicationPhase, *, action: str | None = None, commit_id: str | None = None, failure_code: str | None = None, failure_message: str | None = None, blocked_from_phase: PublicationPhase | None = None) -> None:
         with self.transaction() as db:
             current = db.execute("SELECT phase FROM publication_journals WHERE batch_id=?", (batch_id,)).fetchone()
@@ -168,7 +272,7 @@ class StateStore:
                 job = db.execute("SELECT * FROM jobs WHERE id=?", (row["job_id"],)).fetchone()
                 if not job or job["batch_id"] != batch_id or job["status"] not in {"source_ready", "complete"} or job["content_hash"] != row["expected_content_hash"]:
                     raise ValueError(f"journaled source job {row['job_id']} no longer matches the publication")
-                db.execute("UPDATE jobs SET status='complete', commit_id=?, updated_at=? WHERE id=?", (commit_id, now, row["job_id"]))
+                db.execute("UPDATE jobs SET status='complete', commit_id=?, cleanup_pending=1, updated_at=? WHERE id=?", (commit_id, now, row["job_id"]))
             db.execute("""UPDATE jobs SET queue_acknowledged=1, updated_at=?
                 WHERE id IN (SELECT job_id FROM publication_jobs WHERE batch_id=? AND role='queue_ack')""", (now, batch_id))
             db.execute("UPDATE batches SET status='complete', commit_id=?, updated_at=? WHERE id=?", (commit_id, now, batch_id))
@@ -195,13 +299,20 @@ class StateStore:
         with self.transaction() as db:
             db.execute("UPDATE jobs SET status='claimed', updated_at=? WHERE status='processing'", (now,))
             db.execute("UPDATE batches SET status='running', updated_at=? WHERE status='running'", (now,))
+            db.execute(
+                """UPDATE jobs SET status='failed', retryable=1, failure_code='candidate_missing',
+                   failure_message='source_ready job has no durable source candidate', updated_at=?
+                   WHERE status='source_ready' AND id NOT IN (SELECT job_id FROM source_candidates)""",
+                (now,),
+            )
 
     def claim(self, kind: str, source_key: str, original_locator: str, *, input_artifact: str | None, batch_id: str, captured_at: str | None = None) -> Job:
         now = utc_now()
         with self.transaction() as db:
             row = db.execute("SELECT * FROM jobs WHERE source_key=?", (source_key,)).fetchone()
             if row:
-                db.execute("UPDATE jobs SET batch_id=?, input_artifact=COALESCE(?, input_artifact), updated_at=? WHERE id=?", (batch_id, input_artifact, now, row["id"]))
+                if row["status"] not in {"failed", "source_ready"}:
+                    db.execute("UPDATE jobs SET batch_id=?, input_artifact=COALESCE(?, input_artifact), updated_at=? WHERE id=?", (batch_id, input_artifact, now, row["id"]))
                 row = db.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
             else:
                 job_id = uuid.uuid4().hex
@@ -284,6 +395,22 @@ class StateStore:
         if values["blocked_from_phase"] is not None:
             values["blocked_from_phase"] = PublicationPhase(values["blocked_from_phase"])
         return PublicationJournal(**values)
+
+    @staticmethod
+    def _source_candidate(row: sqlite3.Row) -> SourceCandidateRecord:
+        return SourceCandidateRecord(
+            job_id=row["job_id"],
+            source_identity=row["source_identity"],
+            source_version=row["source_version"],
+            relative_path=row["relative_path"],
+            artifact_path=row["artifact_path"],
+            manifest_path=row["manifest_path"],
+            manifest_hash=row["manifest_hash"],
+            rendered_hash=row["rendered_hash"],
+            lifecycle=SourceCandidateLifecycle(row["lifecycle"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
 
     @staticmethod
     def _require_publication_transition(current: PublicationPhase, target: PublicationPhase) -> None:

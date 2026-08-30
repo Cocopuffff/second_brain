@@ -35,7 +35,7 @@ The equivalent Codex configuration is:
 
 Image interpretation is a separate adapter. The safe default retains a meaningful image only when its caption or alt text is evidence; a configured processor can describe an image in place. Image bytes are never copied into `Sources/`.
 
-YouTube version 1 accepts a client adapter or fixture and prefers manual source-language transcripts, then automatic transcripts. It does not download audio or use Whisper fallback. Initial OAuth setup is deliberately external: store client material and refresh tokens outside the vault, then connect a `YouTubeClient` implementation.
+YouTube version 1 accepts a client adapter or fixture and prefers manual source-language transcripts, then automatic transcripts. It does not download audio or use Whisper fallback. The batch persists playlist-acknowledgement intent with each prepared candidate but does not execute external acknowledgement in SEC-7; that behavior is reserved for SEC-8. Initial OAuth setup is deliberately external: store client material and refresh tokens outside the vault, then connect a `YouTubeClient` implementation.
 
 Install and enable the Obsidian Advanced URI community plugin yourself. Article citations use encoded `obsidian://adv-uri` links to stable physical source lines; YouTube citations link to the starting timestamp.
 
@@ -43,6 +43,6 @@ Install and enable the Obsidian Advanced URI community plugin yourself. Article 
 
 The SQLite lifecycle records claims, attempts, failures, acknowledgements, source hashes, cleanup, and Git commit IDs. Each non-empty publication also has a durable journal and an external rollback snapshot. Re-running a batch reconciles the oldest interrupted publication before accepting new input; that recovery invocation reports its action and stops. A blocked recovery is never guessed through: inspect `status`, repair only the reported condition, and rerun.
 
-Raw HTML is removed only after the corresponding source is included in a confirmed commit and finalized in SQLite. Cleanup is independently retryable, so a cleanup failure never re-renders or recommits a source. Failed synthesis leaves candidate work and raw HTML uncommitted. Re-submit a failed job through the retry command; do not edit the vault source evidence.
+Preparation persists exact rendered source bytes plus a manifest under the external state directory before setting `source_ready`. The oldest valid source-ready batch is resumed before new acquisition, loading those bytes without rediscovery, network access, transcript lookup, extraction, or rendering. Raw HTML is removed only after the corresponding source is included in a confirmed commit and finalized in SQLite. Cleanup is independently retryable, so a cleanup failure never re-renders or recommits a source. After finalization, rendered candidate payloads are removed while manifests and identity hashes remain. Failed synthesis leaves candidate work and raw HTML uncommitted. Re-submit a failed job through the retry command; do not edit the vault source evidence.
 
 An explicit refresh should create a new immutable source version and file rather than overwrite an existing source. The implementation keeps source formatting deterministic: UTF-8, LF endings, fixed frontmatter order, stable hashes, and a trailing newline.

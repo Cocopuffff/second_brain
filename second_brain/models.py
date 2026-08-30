@@ -12,6 +12,48 @@ PublicationOperation = Literal["write", "delete"]
 PublicationJobRole = Literal["source", "queue_ack"]
 
 
+@dataclass(frozen=True)
+class PublicationIntent:
+    """Durable work that publication may finish after source preparation."""
+
+    queue_path: str | None = None
+    queue_locator: str | None = None
+    youtube_playlist_item_id: str | None = None
+    raw_path: str | None = None
+    raw_hash: str | None = None
+
+
+@dataclass(frozen=True)
+class ArticleEvidenceBounds:
+    first_line: int
+    last_line: int
+
+
+@dataclass(frozen=True)
+class YouTubeEvidenceBounds:
+    first_second: float
+    last_second: float
+
+
+EvidenceBounds = ArticleEvidenceBounds | YouTubeEvidenceBounds
+
+
+class PreparationFailureCategory(StrEnum):
+    INVALID_INPUT = "invalid_input"
+    EXTRACTION_FAILED = "extraction_failed"
+    TRANSCRIPT_MISSING = "transcript_missing"
+    VERSION_COLLISION = "version_collision"
+    PATH_COLLISION = "path_collision"
+    PERSISTENCE_FAILED = "persistence_failed"
+    CANDIDATE_MISSING = "candidate_missing"
+    CANDIDATE_CORRUPT = "candidate_corrupt"
+
+
+class SourceCandidateLifecycle(StrEnum):
+    PREPARED = "prepared"
+    PAYLOAD_REMOVED = "payload_removed"
+
+
 class PublicationPhase(StrEnum):
     CANDIDATE_VALIDATED = "candidate_validated"
     ROLLBACK_SNAPSHOT_RECORDED = "rollback_snapshot_recorded"
@@ -151,6 +193,19 @@ class VideoInput:
 
 
 @dataclass(frozen=True)
+class AcquiredArticle:
+    html: str
+    input_method: str
+    publication_intent: PublicationIntent = field(default_factory=PublicationIntent)
+
+
+@dataclass(frozen=True)
+class AcquiredYouTube:
+    video: VideoInput
+    publication_intent: PublicationIntent = field(default_factory=PublicationIntent)
+
+
+@dataclass(frozen=True)
 class SourceDocument:
     source_id: str
     kind: SourceKind
@@ -161,6 +216,86 @@ class SourceDocument:
     relative_path: str
     content_hash: str
     source_version: int
+
+
+@dataclass(frozen=True)
+class SourceCandidate:
+    """A validated source plus the exact bytes persisted for later consumers."""
+
+    job_id: str
+    source: SourceDocument
+    source_identity: str
+    artifact_path: str
+    manifest_path: str
+    manifest_hash: str
+    input_fingerprint: str
+    rendered_markdown: bytes
+    rendered_hash: str
+    evidence_bounds: EvidenceBounds
+    publication_intent: PublicationIntent
+
+    @property
+    def source_id(self) -> str:
+        return self.source.source_id
+
+    @property
+    def kind(self) -> SourceKind:
+        return self.source.kind
+
+    @property
+    def canonical_url(self) -> str:
+        return self.source.canonical_url
+
+    @property
+    def title(self) -> str:
+        return self.source.title
+
+    @property
+    def content(self) -> str:
+        return self.source.content
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return self.source.metadata
+
+    @property
+    def relative_path(self) -> str:
+        return self.source.relative_path
+
+    @property
+    def content_hash(self) -> str:
+        return self.source.content_hash
+
+    @property
+    def source_version(self) -> int:
+        return self.source.source_version
+
+
+@dataclass(frozen=True)
+class PreparationFailure:
+    job_id: str
+    category: PreparationFailureCategory
+    safe_message: str
+    retryable: bool = True
+
+    @property
+    def message(self) -> str:
+        return self.safe_message
+
+
+@dataclass(frozen=True)
+class SourceCandidateRecord:
+    job_id: str
+    source_identity: str
+    source_version: int
+    relative_path: str
+    artifact_path: str
+    manifest_path: str
+    manifest_hash: str
+    rendered_hash: str
+    lifecycle: SourceCandidateLifecycle
+    created_at: str
+    updated_at: str
 
 
 @dataclass(frozen=True)

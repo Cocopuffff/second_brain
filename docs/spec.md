@@ -110,8 +110,10 @@ A normal batch performs:
 ```text
 acquire single-process lock
 → recover interrupted work
+→ resume the oldest valid source-ready batch from durable candidates
 → claim article URLs, saved HTML, and YouTube entries
-→ record tracked-queue and external-acknowledgement intent
+→ record tracked-queue and deferred YouTube-acknowledgement intent
+→ prepare and persist exact source candidates
 → ingest every processable source
 → synthesize once over successful batch sources
 → validate candidate changes
@@ -158,6 +160,8 @@ claimed → processing → source_ready → complete
 ```
 
 `source_ready` means preparation succeeded and an exact source candidate is durably available outside the live vault. It is not completion. Only publication finalization may move a source-ready job to `complete`. A synthesis failure leaves the job and candidate source-ready for retry without refetching, retranscribing, reinterpreting images, reallocating a version, or changing rendered bytes.
+
+Before accepting new work, the runner resumes the oldest valid source-ready batch and rehydrates its candidates from the external state directory. The recovery path does not touch article discovery, HTTP, image processing, transcript lookup, or YouTube discovery. A legacy `source_ready` job without a candidate record becomes a retryable `candidate_missing` failure and is never reacquired automatically.
 
 An interrupted `processing` job is recoverable because batches are explicit finite runs. On restart, the application identifies an unfinished batch and safely resumes or resets its incomplete jobs.
 
@@ -339,6 +343,20 @@ Concept synthesis is in English even when the evidence is Mandarin, Chinese, or 
 
 There is no per-source LLM summary.
 
+### Preparation seam
+
+The public preparation interface is:
+
+```text
+build_source_preparation(config, state, image_processor=None) → SourcePreparation
+SourcePreparation.prepare(job, acquired_payload) → SourceCandidate | PreparationFailure
+SourcePreparation.load(job) → SourceCandidate | PreparationFailure
+```
+
+Preparation owns attempt tracking, extraction, rendering, deterministic version allocation, evidence-bound calculation, validation, and the `source_ready` transition. It persists `manifest.json` and exact rendered Markdown bytes beneath the external state directory using a temporary directory, fsync, and atomic rename before recording the candidate in SQLite. An exact orphan is adopted idempotently; mismatched identity, version, path, manifest, bytes, symlink, or bounds fail explicitly. Article bounds are the first and last valid physical lines in the final bytes. YouTube bounds are the transcript’s first start and final end timestamps parsed from the final bytes.
+
+The candidate records both the tracked article queue intent and saved-HTML fingerprint, or the YouTube playlist acknowledgement intent. SEC-7 persists that YouTube intent but does not execute external acknowledgement; acknowledgement execution remains a later intake concern. Publication receives the candidate’s bytes, writes them unchanged, and retains the manifest and identity hashes after removing the rendered candidate payload and committed raw inputs.
+
 Concept interpretation, thematic synthesis, recommendations, and cross-source conclusions must not be written into `Sources/`.
 
 ### 13. Concept synthesis
@@ -506,10 +524,11 @@ SQLite and filesystem search are sufficient. The implementation must not introdu
 
 ### Public seams
 
-Tests exercise behavior through two public seams:
+Tests exercise behavior through three public seams:
 
-1. The batch CLI using temporary vault, state, Git, HTTP, and YouTube fixtures.
-2. The `second_brain.synthesis` public package using a fake DeepSeek transport, a fake Codex CLI executable, real temporary candidate workspaces, and deterministic image-processor adapters.
+1. The `second_brain.preparation` public package using independently authored article and YouTube fixtures and temporary external state.
+2. The batch CLI using temporary vault, state, Git, HTTP, and YouTube fixtures.
+3. The `second_brain.synthesis` public package using a fake DeepSeek transport, a fake Codex CLI executable, real temporary candidate workspaces, and deterministic image-processor adapters.
 
 Tests do not directly assert private helpers or internal SQL implementation details.
 
@@ -546,8 +565,8 @@ Tests do not directly assert private helpers or internal SQL implementation deta
 29. Manual source-language transcripts are preferred over automatic transcripts.
 30. Automatic source-language transcripts are accepted when manual transcripts are unavailable.
 31. A missing transcript fails without audio fallback.
-32. A video is removed from the playlist only during finalization after successful publication.
-33. Failed playlist removal is retried without duplicating, reacquiring, or republishing the job.
+32. A YouTube playlist acknowledgement intent is persisted with the candidate without executing external acknowledgement in SEC-7.
+33. Source-ready retry never calls YouTube discovery or acknowledgement.
 34. Concept alias reconciliation can reuse an existing concept.
 35. Conflicting claims remain separately represented and cited.
 36. An executor write outside `Concepts/` rejects the complete change set.
@@ -564,6 +583,7 @@ Tests do not directly assert private helpers or internal SQL implementation deta
 47. Codex execution uses the fixed safety flags and rejects mismatched claims, modified inputs, unexpected directories, symlinks, and non-Markdown effects.
 48. A failed synthesis preserves the exact durable source candidate and `source_ready` state while leaving publication, completion, queue acknowledgement, Git, and cleanup unchanged.
 49. Retrying a source-ready job reuses the exact prepared candidate without reacquisition or rerendering.
+50. Publication materializes the exact prepared source bytes and retains only the candidate manifest and identity hashes after finalization.
 
 Failpoints should be exposed at durable boundaries so crash-window tests remain deterministic.
 

@@ -6,7 +6,7 @@ import textwrap
 from datetime import date
 from typing import Any
 
-from .models import SourceDocument
+from .models import SourceDocument, SourceKind
 
 
 SOURCE_FORMAT_VERSION = "1"
@@ -36,13 +36,13 @@ def _yaml_scalar(value: Any) -> str:
     return f'"{value}"'
 
 
-def render_source(*, source_id: str, kind: str, canonical_url: str, title: str, body: str, author: str | None, publication_date: str | None, captured_at: str, input_method: str, source_version: int = 1) -> SourceDocument:
+def render_source(*, source_id: str, kind: SourceKind, canonical_url: str, title: str, body: str, author: str | None, publication_date: str | None, captured_at: str, input_method: str, source_version: int = 1) -> SourceDocument:
     normalized = normalize_body(body)
     stable_metadata = "\n".join([source_id, kind, canonical_url, title, author or "", publication_date or "", captured_at, input_method, str(source_version)])
     content_hash = hashlib.sha256((stable_metadata + "\n" + normalized).encode("utf-8")).hexdigest()
     metadata = {"source_id": source_id, "source_type": kind, "canonical_url": canonical_url, "title": title, "author": author, "publication_date": publication_date, "captured_at": captured_at, "input_method": input_method, "content_hash": content_hash, "source_format_version": SOURCE_FORMAT_VERSION, "immutable_source_version": source_version}
     folder = "Articles" if kind == "article" else "YouTube"
-    return SourceDocument(source_id=source_id, kind=kind, canonical_url=canonical_url, title=title, content=normalized, metadata=metadata, relative_path=f"Sources/{folder}/{source_id}.md", content_hash=content_hash, source_version=source_version)
+    return SourceDocument(source_id=source_id, kind=kind, canonical_url=canonical_url, title=title, content=normalized, metadata=metadata, relative_path=f"Sources/{folder}/{source_filename_version(source_id, source_version)}", content_hash=content_hash, source_version=source_version)
 
 
 def render_markdown(document: SourceDocument) -> str:

@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from .models import Job, PublicationEntry, PublicationJobRecord, PublicationJournal, PublicationPhase, SourceCandidateLifecycle, SourceCandidateRecord, UNRESOLVED_PUBLICATION_PHASES, publication_transition_allowed, utc_now
+from .models import Job, PublicationEntry, PublicationIntent, PublicationJobRecord, PublicationJournal, PublicationPhase, SourceCandidateLifecycle, SourceCandidateRecord, UNRESOLVED_PUBLICATION_PHASES, publication_transition_allowed, utc_now
 
 
 SCHEMA = """
@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   content_hash TEXT,
   source_version INTEGER,
   captured_at TEXT,
+  queue_path TEXT,
+  queue_locator TEXT,
+  youtube_playlist_item_id TEXT,
   queue_acknowledged INTEGER NOT NULL DEFAULT 0,
   cleanup_pending INTEGER NOT NULL DEFAULT 0,
   commit_id TEXT,
@@ -76,6 +79,17 @@ CREATE TABLE IF NOT EXISTS publication_jobs (
   PRIMARY KEY (batch_id, job_id, role)
 );
 CREATE INDEX IF NOT EXISTS publication_phase_idx ON publication_journals(phase, created_at);
+CREATE TABLE IF NOT EXISTS publication_acknowledgements (
+  batch_id TEXT NOT NULL REFERENCES publication_journals(batch_id),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  kind TEXT NOT NULL CHECK (kind IN ('youtube_playlist')),
+  external_id TEXT NOT NULL,
+  acknowledged INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (batch_id, job_id, kind)
+);
 CREATE TABLE IF NOT EXISTS source_candidates (
   job_id TEXT PRIMARY KEY REFERENCES jobs(id),
   source_identity TEXT NOT NULL UNIQUE,
@@ -100,6 +114,13 @@ class StateStore:
         self.connection = sqlite3.connect(path, timeout=30, isolation_level=None)
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(SCHEMA)
+        self._migrate_jobs()
+
+    def _migrate_jobs(self) -> None:
+        columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(jobs)")}
+        for name in ("queue_path", "queue_locator", "youtube_playlist_item_id"):
+            if name not in columns:
+                self.connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} TEXT")
 
     def close(self) -> None:
         self.connection.close()
@@ -122,7 +143,7 @@ class StateStore:
             db.execute("INSERT INTO batches VALUES (?, 'running', ?, ?, NULL)", (batch_id, now, now))
         return batch_id
 
-    def write_publication_journal(self, batch_id: str, *, phase: PublicationPhase, candidate_workspace: str, candidate_manifest_hash: str, base_commit: str, entries: list[PublicationEntry], jobs: list[PublicationJobRecord]) -> None:
+    def write_publication_journal(self, batch_id: str, *, phase: PublicationPhase, candidate_workspace: str, candidate_manifest_hash: str, base_commit: str, entries: list[PublicationEntry], jobs: list[PublicationJobRecord], acknowledgements: list[tuple[str, str]]) -> None:
         now = utc_now()
         with self.transaction() as db:
             db.execute("""INSERT INTO publication_journals
@@ -134,6 +155,45 @@ class StateStore:
             db.executemany("""INSERT INTO publication_jobs
                 (batch_id, job_id, role, expected_content_hash, raw_path, raw_hash)
                 VALUES (?, ?, ?, ?, ?, ?)""", [(batch_id, item.job_id, item.role, item.expected_content_hash, item.raw_path, item.raw_hash) for item in jobs])
+            db.executemany(
+                """INSERT INTO publication_acknowledgements
+                   (batch_id, job_id, kind, external_id, updated_at)
+                   VALUES (?, ?, 'youtube_playlist', ?, ?)""",
+                [(batch_id, job_id, external_id, now) for job_id, external_id in acknowledgements],
+            )
+
+    def pending_publication_acknowledgements(self, batch_id: str) -> list[dict[str, str | int]]:
+        return [
+            dict(row)
+            for row in self.connection.execute(
+                """SELECT batch_id, job_id, kind, external_id, attempts, last_error
+                   FROM publication_acknowledgements
+                   WHERE batch_id=? AND acknowledged=0
+                   ORDER BY job_id, kind""",
+                (batch_id,),
+            )
+        ]
+
+    def record_publication_acknowledgement_failure(self, batch_id: str, job_id: str, kind: str, message: str) -> None:
+        with self.transaction() as db:
+            db.execute(
+                """UPDATE publication_acknowledgements
+                   SET attempts=attempts+1, last_error=?, updated_at=?
+                   WHERE batch_id=? AND job_id=? AND kind=? AND acknowledged=0""",
+                (message, utc_now(), batch_id, job_id, kind),
+            )
+
+    def complete_publication_acknowledgement(self, batch_id: str, job_id: str, kind: str) -> None:
+        now = utc_now()
+        with self.transaction() as db:
+            updated = db.execute(
+                """UPDATE publication_acknowledgements
+                   SET acknowledged=1, attempts=attempts+1, last_error=NULL, updated_at=?
+                   WHERE batch_id=? AND job_id=? AND kind=? AND acknowledged=0""",
+                (now, batch_id, job_id, kind),
+            )
+            if updated.rowcount:
+                db.execute("UPDATE jobs SET queue_acknowledged=1, updated_at=? WHERE id=?", (now, job_id))
 
     def publication(self, batch_id: str) -> PublicationJournal | None:
         row = self.connection.execute("SELECT * FROM publication_journals WHERE batch_id=?", (batch_id,)).fetchone()
@@ -298,7 +358,7 @@ class StateStore:
         now = utc_now()
         with self.transaction() as db:
             db.execute("UPDATE jobs SET status='claimed', updated_at=? WHERE status='processing'", (now,))
-            db.execute("UPDATE batches SET status='running', updated_at=? WHERE status='running'", (now,))
+            db.execute("UPDATE batches SET status='failed', updated_at=? WHERE status='running'", (now,))
             db.execute(
                 """UPDATE jobs SET status='failed', retryable=1, failure_code='candidate_missing',
                    failure_message='source_ready job has no durable source candidate', updated_at=?
@@ -306,20 +366,50 @@ class StateStore:
                 (now,),
             )
 
-    def claim(self, kind: str, source_key: str, original_locator: str, *, input_artifact: str | None, batch_id: str, captured_at: str | None = None) -> Job:
+    def claim(self, kind: str, source_key: str, original_locator: str, *, input_artifact: str | None, batch_id: str, captured_at: str | None = None, publication_intent: PublicationIntent | None = None) -> Job:
+        job, _owned = self.claim_exclusive(
+            kind,
+            source_key,
+            original_locator,
+            input_artifact=input_artifact,
+            batch_id=batch_id,
+            captured_at=captured_at,
+            publication_intent=publication_intent,
+        )
+        return job
+
+    def claim_exclusive(self, kind: str, source_key: str, original_locator: str, *, input_artifact: str | None, batch_id: str, captured_at: str | None = None, publication_intent: PublicationIntent | None = None) -> tuple[Job, bool]:
         now = utc_now()
+        intent = publication_intent or PublicationIntent()
+        owned = False
         with self.transaction() as db:
             row = db.execute("SELECT * FROM jobs WHERE source_key=?", (source_key,)).fetchone()
             if row:
-                if row["status"] not in {"failed", "source_ready"}:
-                    db.execute("UPDATE jobs SET batch_id=?, input_artifact=COALESCE(?, input_artifact), updated_at=? WHERE id=?", (batch_id, input_artifact, now, row["id"]))
+                if row["status"] in {"claimed", "processing"} and row["batch_id"] == batch_id:
+                    owned = True
+                elif row["status"] in {"claimed", "processing"}:
+                    owner = db.execute("SELECT status FROM batches WHERE id=?", (row["batch_id"],)).fetchone()
+                    if owner is None or owner["status"] != "running":
+                        owned = True
+                if owned:
+                    db.execute(
+                        """UPDATE jobs SET batch_id=?, input_artifact=COALESCE(?, input_artifact),
+                           queue_path=COALESCE(?, queue_path), queue_locator=COALESCE(?, queue_locator),
+                           youtube_playlist_item_id=COALESCE(?, youtube_playlist_item_id), updated_at=? WHERE id=?""",
+                        (batch_id, input_artifact, intent.queue_path, intent.queue_locator, intent.youtube_playlist_item_id, now, row["id"]),
+                    )
                 row = db.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
             else:
                 job_id = uuid.uuid4().hex
-                db.execute("""INSERT INTO jobs (id, kind, source_key, original_locator, input_artifact, batch_id, status, captured_at, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)""", (job_id, kind, source_key, original_locator, input_artifact, batch_id, captured_at or now, now, now))
+                db.execute("""INSERT INTO jobs
+                    (id, kind, source_key, original_locator, input_artifact, batch_id, status, captured_at,
+                     queue_path, queue_locator, youtube_playlist_item_id, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, ?, ?)""",
+                    (job_id, kind, source_key, original_locator, input_artifact, batch_id, captured_at or now,
+                     intent.queue_path, intent.queue_locator, intent.youtube_playlist_item_id, now, now))
                 row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-        return self._job(row)
+                owned = True
+        return self._job(row), owned
 
     def attach_artifact(self, job_id: str, path: str) -> None:
         with self.transaction() as db:
@@ -379,14 +469,14 @@ class StateStore:
             row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if not row:
                 raise KeyError(job_id)
-            if not row["retryable"] and row["status"] != "failed":
+            if not row["retryable"]:
                 raise ValueError(f"job {job_id} is not retryable")
             db.execute("UPDATE jobs SET status='claimed', batch_id=?, failure_code=NULL, failure_message=NULL, updated_at=? WHERE id=?", (batch_id, utc_now(), job_id))
             row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return self._job(row)
 
     def _job(self, row: sqlite3.Row) -> Job:
-        return Job(id=row["id"], kind=row["kind"], source_key=row["source_key"], original_locator=row["original_locator"], input_artifact=row["input_artifact"], batch_id=row["batch_id"], status=row["status"], attempts=row["attempts"], retryable=bool(row["retryable"]), failure_code=row["failure_code"], failure_message=row["failure_message"], content_hash=row["content_hash"], source_version=row["source_version"], captured_at=row["captured_at"], queue_acknowledged=bool(row["queue_acknowledged"]), cleanup_pending=bool(row["cleanup_pending"]), commit_id=row["commit_id"])
+        return Job(id=row["id"], kind=row["kind"], source_key=row["source_key"], original_locator=row["original_locator"], input_artifact=row["input_artifact"], batch_id=row["batch_id"], status=row["status"], attempts=row["attempts"], retryable=bool(row["retryable"]), failure_code=row["failure_code"], failure_message=row["failure_message"], content_hash=row["content_hash"], source_version=row["source_version"], captured_at=row["captured_at"], queue_path=row["queue_path"], queue_locator=row["queue_locator"], youtube_playlist_item_id=row["youtube_playlist_item_id"], queue_acknowledged=bool(row["queue_acknowledged"]), cleanup_pending=bool(row["cleanup_pending"]), commit_id=row["commit_id"])
 
     @staticmethod
     def _publication_journal(row: sqlite3.Row) -> PublicationJournal:

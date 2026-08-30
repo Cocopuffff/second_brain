@@ -14,6 +14,7 @@ from .git_ops import GitError, GitRepository
 from .models import CLEANUP_PUBLICATION_PHASES, Job, PublicationEntry, PublicationJobRecord, PublicationJournal, PublicationOperation, PublicationPhase, PublicationSnapshotEntry
 from .preparation import PreparationError
 from .state import StateStore
+from .youtube import YouTubeAcknowledgement
 
 
 class PublicationError(RuntimeError):
@@ -47,12 +48,13 @@ class PublicationResult:
 
 
 class BatchPublication:
-    def __init__(self, config: Config, state: StateStore, git: GitRepository, *, faults: PublicationFaults | None = None, candidate_cleanup: Callable[[str], None] | None = None):
+    def __init__(self, config: Config, state: StateStore, git: GitRepository, *, faults: PublicationFaults | None = None, candidate_cleanup: Callable[[str], None] | None = None, youtube_acknowledger: Callable[[str], YouTubeAcknowledgement] | None = None):
         self.config = config
         self.state = state
         self.git = git
         self.faults = faults or NoopFaults()
         self.candidate_cleanup = candidate_cleanup
+        self.youtube_acknowledger = youtube_acknowledger
         self.root = config.state_dir / "publications"
 
     def recover_oldest(self) -> PublicationResult | None:
@@ -97,7 +99,7 @@ class BatchPublication:
         self._compact(batch_id)
         return PublicationResult(batch_id, PublicationPhase.ROLLED_BACK, "rolled_back_uncommitted")
 
-    def publish(self, batch_id: str, files: Mapping[str, str | bytes], deletions: tuple[str, ...], *, queue_path: str | None, queue_job_ids: list[str], source_jobs: list[Job], raw_fingerprints: dict[str, tuple[str, str | None]] | None = None, synthesis_metadata: Mapping[str, Any] | None = None) -> PublicationResult:
+    def publish(self, batch_id: str, files: Mapping[str, str | bytes], deletions: tuple[str, ...], *, queue_path: str | None, queue_job_ids: list[str], source_jobs: list[Job], youtube_acknowledgements: dict[str, str] | None = None, raw_fingerprints: dict[str, tuple[str, str | None]] | None = None, synthesis_metadata: Mapping[str, Any] | None = None) -> PublicationResult:
         entries = self._prepare_entries(files, deletions, queue_path)
         if not entries:
             raise PublicationError("empty_publication", "validated candidate has no changes")
@@ -120,7 +122,7 @@ class BatchPublication:
         self._assert_external_path_safe(manifest_path, workspace, "candidate manifest")
         self._write_json(manifest_path, manifest)
         manifest_hash = self._sha256_json(manifest)
-        self.state.write_publication_journal(batch_id, phase=PublicationPhase.CANDIDATE_VALIDATED, candidate_workspace=str(workspace), candidate_manifest_hash=manifest_hash, base_commit=self.git.head(), entries=entries, jobs=self._job_records(queue_job_ids, source_jobs, raw_fingerprints or {}))
+        self.state.write_publication_journal(batch_id, phase=PublicationPhase.CANDIDATE_VALIDATED, candidate_workspace=str(workspace), candidate_manifest_hash=manifest_hash, base_commit=self.git.head(), entries=entries, jobs=self._job_records(queue_job_ids, source_jobs, raw_fingerprints or {}), acknowledgements=list((youtube_acknowledgements or {}).items()))
         self._fault("journal_written", batch_id=batch_id)
 
         snapshot = self._capture_snapshot(workspace, entries)
@@ -209,15 +211,39 @@ class BatchPublication:
     def _cleanup_journal(self, journal: PublicationJournal) -> int:
         batch_id = journal.batch_id
         jobs = self.state.publication_jobs(batch_id)
+        acknowledgements = self.state.pending_publication_acknowledgements(batch_id)
         pending = []
         for item in jobs:
             job = self.state.get(item.job_id)
             if item.role == "source" and job is not None and job.cleanup_pending:
                 pending.append(item)
-        if pending:
+        if pending or acknowledgements:
             self.state.mark_publication_cleanup_pending(batch_id)
+        blocked_acknowledgements: set[str] = set()
+        for acknowledgement in acknowledgements:
+            job_id = str(acknowledgement["job_id"])
+            kind = str(acknowledgement["kind"])
+            external_id = str(acknowledgement["external_id"])
+            try:
+                if self.youtube_acknowledger is None:
+                    raise PublicationError("youtube_acknowledger_unavailable", "YouTube acknowledgement requires the configured client")
+                acknowledgement = self.youtube_acknowledger(external_id)
+                if acknowledgement not in {YouTubeAcknowledgement.REMOVED, YouTubeAcknowledgement.ALREADY_ABSENT}:
+                    raise PublicationError("youtube_acknowledgement_invalid", "YouTube client returned an unknown acknowledgement result")
+                self._fault("youtube_acknowledged", batch_id=batch_id, job_id=job_id, external_id=external_id)
+                self.state.complete_publication_acknowledgement(batch_id, job_id, kind)
+            except PublicationCrash:
+                raise
+            except Exception as exc:
+                message = exc.message if isinstance(exc, PublicationError) else str(exc)
+                code = exc.code if isinstance(exc, PublicationError) else "youtube_acknowledgement_failed"
+                self.state.record_publication_acknowledgement_failure(batch_id, job_id, kind, message)
+                self.state.update_publication(batch_id, PublicationPhase.CLEANUP_PENDING, action="cleanup_pending", failure_code=code, failure_message=message)
+                blocked_acknowledgements.add(job_id)
         cleaned = 0
         for item in pending:
+            if item.job_id in blocked_acknowledgements:
+                continue
             path = Path(item.raw_path) if item.raw_path else None
             try:
                 if path is not None:
@@ -248,7 +274,8 @@ class BatchPublication:
             and (job := self.state.get(item.job_id)) is not None
             and job.cleanup_pending
         ]
-        if not remaining:
+        remaining_acknowledgements = self.state.pending_publication_acknowledgements(batch_id)
+        if not remaining and not remaining_acknowledgements:
             self.state.mark_publication_complete(batch_id)
             self._compact(batch_id)
         return cleaned
@@ -421,7 +448,7 @@ class BatchPublication:
     def _job_records(self, queue_job_ids: list[str], source_jobs: list[Job], raw_fingerprints: dict[str, tuple[str, str | None]]) -> list[PublicationJobRecord]:
         records = [PublicationJobRecord(job_id=job_id, role="queue_ack") for job_id in queue_job_ids]
         for job in source_jobs:
-            raw_path, raw_hash = raw_fingerprints.get(job.id, (job.input_artifact, None))
+            raw_path, raw_hash = raw_fingerprints.get(job.id, (None, None))
             records.append(PublicationJobRecord(job_id=job.id, role="source", expected_content_hash=job.content_hash, raw_path=raw_path, raw_hash=raw_hash))
         return records
 

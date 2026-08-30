@@ -91,7 +91,7 @@ def test_untrusted_synthesis_write_is_rejected_without_commit(tmp_path: Path):
 def test_youtube_manual_transcript_is_preferred_and_cited(tmp_path: Path):
     vault, config = make_vault(tmp_path)
     fixture = tmp_path / "youtube.json"
-    fixture.write_text('{"To Ingest": [{"video_id": "abcDEF12345", "title": "Video", "manual_transcript": [{"start": 12, "end": 20, "text": "Manual evidence"}], "automatic_transcript": [{"start": 12, "end": 20, "text": "Automatic evidence"}]}]}', encoding="utf-8")
+    fixture.write_text('{"To Ingest": [{"video_id": "abcDEF12345", "title": "Video", "playlist_item_id": "playlist-item", "manual_transcript": [{"start": 12, "end": 20, "text": "Manual evidence"}], "automatic_transcript": [{"start": 12, "end": 20, "text": "Automatic evidence"}]}]}', encoding="utf-8")
     report = BatchRunner(config, youtube_client=FixtureYouTubeClient(fixture)).run()
     assert report.committed
     source = next((vault / "Sources/YouTube").glob("*.md"))

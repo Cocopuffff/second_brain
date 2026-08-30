@@ -5,7 +5,7 @@ from pathlib import Path
 
 from second_brain.batch import BatchRunner
 from second_brain.config import Config
-from second_brain.models import ChangeSet
+from second_brain.models import ChangeSet, VideoInput
 from second_brain.synthesis import ExecutorIdentity, FailureCategory, SynthesisFailure, SynthesisMetadata, SynthesisOutcome
 from second_brain.state import StateStore
 from second_brain.youtube import FixtureYouTubeClient
@@ -92,19 +92,23 @@ class _NoDiscoveryClient:
     def __init__(self, fixture: Path):
         self.fixture = fixture
         self.calls = 0
+        self.acknowledged: list[str] = []
 
-    def list_playlist(self, _playlist):
+    def list_playlist(self, playlist: str) -> list[VideoInput]:
         self.calls += 1
         raise AssertionError("source-ready retry rediscovered YouTube input")
 
-    def acknowledge(self, _item):
-        raise AssertionError("SEC-7 must not acknowledge before publication finalization")
+    def acknowledge(self, playlist_item_id: str):
+        from second_brain.youtube import YouTubeAcknowledgement
+
+        self.acknowledged.append(playlist_item_id)
+        return YouTubeAcknowledgement.REMOVED
 
 
 def test_source_ready_youtube_retry_does_not_list_playlist(tmp_path: Path):
     vault, config = _vault(tmp_path, "")
     fixture = tmp_path / "youtube.json"
-    fixture.write_text('{"To Ingest": [{"video_id": "abcDEF12345", "title": "Video", "manual_transcript": [{"start": 12, "end": 20, "text": "Evidence"}]}]}', encoding="utf-8")
+    fixture.write_text('{"To Ingest": [{"video_id": "abcDEF12345", "title": "Video", "playlist_item_id": "playlist-item", "manual_transcript": [{"start": 12, "end": 20, "text": "Evidence"}]}]}', encoding="utf-8")
     synthesis = _ToggleSynthesis()
     first_client = FixtureYouTubeClient(fixture)
 
@@ -118,6 +122,7 @@ def test_source_ready_youtube_retry_does_not_list_playlist(tmp_path: Path):
 
     assert second.committed
     assert second_client.calls == 0
+    assert second_client.acknowledged == ["playlist-item"]
 
 
 def test_preparation_failure_does_not_publish_or_mark_source_ready(tmp_path: Path):

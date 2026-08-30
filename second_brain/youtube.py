@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from enum import StrEnum
 from typing import Protocol
 
 from .canonical import canonical_url, source_key, stable_id
@@ -10,9 +11,14 @@ from .models import SourceDocument, TranscriptSegment, VideoInput
 from .render import render_source
 
 
+class YouTubeAcknowledgement(StrEnum):
+    REMOVED = "removed"
+    ALREADY_ABSENT = "already_absent"
+
+
 class YouTubeClient(Protocol):
     def list_playlist(self, playlist: str) -> list[VideoInput]: ...
-    def acknowledge(self, item: VideoInput) -> None: ...
+    def acknowledge(self, playlist_item_id: str) -> YouTubeAcknowledgement: ...
 
 
 class TranscriptError(RuntimeError):
@@ -23,14 +29,21 @@ class FixtureYouTubeClient:
     def __init__(self, fixture: Path):
         self.fixture = fixture
         self.acknowledged: list[str] = []
+        self.acknowledgement_attempts: list[str] = []
+        self._removed: set[str] = set()
 
     def list_playlist(self, playlist: str) -> list[VideoInput]:
         data = json.loads(self.fixture.read_text(encoding="utf-8"))
         items = data.get(playlist, data if isinstance(data, list) else [])
         return [_video(item) for item in items]
 
-    def acknowledge(self, item: VideoInput) -> None:
-        self.acknowledged.append(item.playlist_item_id or item.video_id)
+    def acknowledge(self, playlist_item_id: str) -> YouTubeAcknowledgement:
+        self.acknowledgement_attempts.append(playlist_item_id)
+        if playlist_item_id in self._removed:
+            return YouTubeAcknowledgement.ALREADY_ABSENT
+        self._removed.add(playlist_item_id)
+        self.acknowledged.append(playlist_item_id)
+        return YouTubeAcknowledgement.REMOVED
 
 
 def _segments(values: list[dict]) -> tuple[TranscriptSegment, ...]:

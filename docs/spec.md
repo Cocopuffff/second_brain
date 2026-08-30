@@ -1,6 +1,6 @@
 # Second Brain Ingestion Specification
 
-**Status:** Living specification; SEC-5 complete, SEC-6 in progress
+**Status:** Living specification; SEC-5 through SEC-8 complete
 **Target location:** `Second Brain/System/Second Brain Ingestion Spec.md`  
 **Vault:** `Second Brain`  
 **Version:** 1.1
@@ -343,6 +343,17 @@ Concept synthesis is in English even when the evidence is Mandarin, Chinese, or 
 
 There is no per-source LLM summary.
 
+### Intake seam
+
+The public intake interface is:
+
+```text
+build_source_intake(config, state, fetcher, youtube_client=None) → SourceIntake
+SourceIntake.collect(batch_id) → IntakeBatch
+```
+
+Repository-owned article and YouTube adapters return the same `IntakeSuccess` and `IntakeFailure` models. Discovery creates stable canonical descriptors and exclusive recoverable claims. Claiming persists article queue or YouTube playlist finalization intent in SQLite before acquisition. Acquisition returns raw article HTML or YouTube transcript data. Intake never changes the tracked article queue, acknowledges a playlist item, removes raw payloads, renders source Markdown, or handles `source_ready` jobs. A YouTube client must report `removed` or `already_absent` for an idempotent acknowledgement.
+
 ### Preparation seam
 
 The public preparation interface is:
@@ -355,7 +366,7 @@ SourcePreparation.load(job) → SourceCandidate | PreparationFailure
 
 Preparation owns attempt tracking, extraction, rendering, deterministic version allocation, evidence-bound calculation, validation, and the `source_ready` transition. It persists `manifest.json` and exact rendered Markdown bytes beneath the external state directory using a temporary directory, fsync, and atomic rename before recording the candidate in SQLite. An exact orphan is adopted idempotently; mismatched identity, version, path, manifest, bytes, symlink, or bounds fail explicitly. Article bounds are the first and last valid physical lines in the final bytes. YouTube bounds are the transcript’s first start and final end timestamps parsed from the final bytes.
 
-The candidate records both the tracked article queue intent and saved-HTML fingerprint, or the YouTube playlist acknowledgement intent. SEC-7 persists that YouTube intent but does not execute external acknowledgement; acknowledgement execution remains a later intake concern. Publication receives the candidate’s bytes, writes them unchanged, and retains the manifest and identity hashes after removing the rendered candidate payload and committed raw inputs.
+The candidate records both the tracked article queue intent and saved-HTML fingerprint, or the YouTube playlist acknowledgement intent. Publication receives the candidate’s bytes, writes them unchanged, then executes the external acknowledgement only after commit finalization. The journal retries failed or interrupted acknowledgements without rediscovery or republication. It retains the manifest and identity hashes after removing rendered candidate payloads and committed raw inputs.
 
 Concept interpretation, thematic synthesis, recommendations, and cross-source conclusions must not be written into `Sources/`.
 
@@ -565,8 +576,8 @@ Tests do not directly assert private helpers or internal SQL implementation deta
 29. Manual source-language transcripts are preferred over automatic transcripts.
 30. Automatic source-language transcripts are accepted when manual transcripts are unavailable.
 31. A missing transcript fails without audio fallback.
-32. A YouTube playlist acknowledgement intent is persisted with the candidate without executing external acknowledgement in SEC-7.
-33. Source-ready retry never calls YouTube discovery or acknowledgement.
+32. A YouTube playlist acknowledgement intent is persisted with the candidate and executed only after successful publication finalization.
+33. Source-ready retry never calls YouTube discovery or acquisition; publication may execute the persisted acknowledgement only after finalization.
 34. Concept alias reconciliation can reuse an existing concept.
 35. Conflicting claims remain separately represented and cited.
 36. An executor write outside `Concepts/` rejects the complete change set.

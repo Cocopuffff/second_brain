@@ -2,10 +2,12 @@
 
 - **Ingestion batch**: one finite, manually invoked attempt to claim inputs, prepare successful source evidence, synthesize concepts, validate candidates, commit them locally, finalize durable state, and clean up committed raw HTML.
 - **Job**: the durable SQLite record for one canonical article or YouTube source after it has been claimed.
+- **Source intake**: the shared article and YouTube boundary that discovers stable work descriptors, obtains one exclusive SQLite claim, and returns either a claimed job with a typed raw payload or a structured failure. It persists queue or playlist finalization intent with the claim, but does not render sources, change capture queues, acknowledge YouTube externally, or clean raw inputs.
 - **Candidate workspace**: state outside live tracked vault directories where proposed source and concept changes are assembled and validated.
 - **Publication**: the recoverable transition that makes a validated candidate visible in the vault and records one local Git commit for the batch.
 - **Publication journal**: the durable SQLite record and external manifests that identify a batch candidate, rollback snapshot, publication phase, commit, and recovery result.
 - **Finalization**: recording the batch commit and completed job state in SQLite after Git confirms the commit.
+- **External acknowledgement**: the idempotent removal of a committed YouTube playlist item during publication finalization. The client reports either `removed` or `already_absent`; the publication journal retains the playlist-item ID and retries failures without rediscovering or republishing the source.
 - **Raw-payload cleanup**: removal of a saved HTML input only after its source is safely committed; it is independently retryable.
 - **Source evidence**: immutable, deterministic Markdown in `Sources/`; it is distinct from mutable concept interpretation in `Concepts/`.
 - **Source preparation**: the durable seam between acquisition and synthesis. It extracts and renders an acquired payload once, validates the exact UTF-8 bytes, allocates an immutable `source_id:vN` identity, persists a manifest and rendered payload under the external state directory, and only then marks the job `source_ready`.

@@ -2,25 +2,23 @@ from __future__ import annotations
 
 import fcntl
 import urllib.request
-from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from .canonical import source_key, stable_id
 from .config import Config
-from .extraction import ImageProcessor, extract_article
+from .extraction import ImageProcessor
 from .git_ops import GitError, GitRepository
-from .html_discovery import discover_html, html_hash
-from .models import AcquiredArticle, AcquiredYouTube, BatchReport, COMMITTED_PUBLICATION_PHASES, ChangeSet, Job, PublicationIntent, PublicationPhase, SourceCandidate, SourceDocument, PreparationFailure, utc_now
+from .html_discovery import discover_html
+from .intake import build_source_intake, queue_path_for
+from .models import BatchReport, COMMITTED_PUBLICATION_PHASES, ChangeSet, Job, PublicationPhase, SourceCandidate, PreparationFailure
 from .preparation import PreparationFaults, SourcePreparation, build_source_preparation
 from .publication import BatchPublication, PublicationCrash, PublicationError, PublicationFaults, PublicationResult
-from .queue import claim_article_queue, remove_claimed_urls_text
-from .render import render_markdown, render_source
+from .queue import remove_claimed_urls_text
 from .state import StateStore
 from .synthesis import ExecutorIdentity, FailureCategory, SynthesisFailure, SynthesisOutcome, SynthesisRunner, build_controlled_synthesis
 from .validation import ValidationError, validate_markdown
-from .youtube import YouTubeClient, render_video_source
+from .youtube import YouTubeClient
 
 
 class BatchError(RuntimeError):
@@ -103,7 +101,14 @@ class BatchRunner:
     def _run_locked(self, state: StateStore, retry_job_id: str | None = None) -> BatchReport:
         git = GitRepository(self.config.vault)
         preparation = build_source_preparation(self.config, state, self.image_processor, faults=self._preparation_faults)
-        publication = BatchPublication(self.config, state, git, faults=self._publication_faults, candidate_cleanup=preparation.compact)
+        publication = BatchPublication(
+            self.config,
+            state,
+            git,
+            faults=self._publication_faults,
+            candidate_cleanup=preparation.compact,
+            youtube_acknowledger=self.youtube_client.acknowledge if self.youtube_client else None,
+        )
         recovery = publication.recover_oldest()
         if recovery:
             return self._publication_report(recovery, state)
@@ -117,95 +122,47 @@ class BatchRunner:
             batch_id = state.create_batch()
             state.rebind_source_ready([job.id for job in source_ready], batch_id)
             return self._run_source_ready_batch(state, preparation, publication, batch_id)
+        intake = build_source_intake(
+            self.config,
+            state,
+            fetcher=self.fetcher,
+            youtube_client=self.youtube_client,
+        )
         # Queue and raw HTML are accepted inputs; every other existing staged,
         # modified, or untracked path is an operator-owned stop condition.
-        allowed_paths = self._allowed_input_paths()
+        allowed_paths = intake.allowed_input_paths()
         git.ensure_clean(allowed_paths=allowed_paths)
         batch_id = state.create_batch()
-        claimed_count = 0
-        failures: list[str] = []
-        sources: list[SourceCandidate] = []
-        source_jobs: list[Job] = []
-        html_by_key: dict[str, list[Path]] = defaultdict(list)
-        youtube_inputs = []
         if retry_job_id:
             try:
                 state.retry(retry_job_id, batch_id)
-                claimed_count += 1
             except (KeyError, ValueError) as exc:
                 state.fail_batch(batch_id)
                 raise BatchError(str(exc)) from exc
-        html_files, html_errors = discover_html(self.config.to_ingest)
-        failures.extend(html_errors)
-        for path, url, _title in html_files:
-            html_by_key[source_key("article", url)].append(path)
-
-        queue_path = self._queue_path()
-        queue_inputs, queue_errors = claim_article_queue(queue_path, state, batch_id, acknowledge=False)
-        queue_job_ids: list[str] = []
-        failures.extend(queue_errors)
-        for item in queue_inputs:
-            key = source_key("article", item.url)
-            job = state.find(key)
-            if job:
-                queue_job_ids.append(job.id)
-            paths = html_by_key.get(key, [])
-            if paths:
-                hashes = {html_hash(path) for path in paths}
-                if len(hashes) > 1:
-                    if job:
-                        state.fail(job.id, "conflicting_html", "multiple non-identical HTML files claim the same canonical URL")
-                    failures.append(f"{item.url}: conflicting HTML payloads")
-                else:
-                    state.attach_artifact(job.id, str(paths[0]))  # type: ignore[union-attr]
-        claimed_count += len(queue_inputs)
-
-        for key, paths in html_by_key.items():
-            if len({html_hash(path) for path in paths}) > 1:
-                if not state.find(key):
-                    job = state.claim("article", key, key.split(":", 1)[1], input_artifact=None, batch_id=batch_id)
-                    state.fail(job.id, "conflicting_html", "multiple non-identical HTML files claim the same canonical URL")
-                continue
-            job = state.find(key)
-            if job is None:
-                job = state.claim("article", key, key.split(":", 1)[1], input_artifact=str(paths[0]), batch_id=batch_id)
-                claimed_count += 1
-            else:
-                state.attach_artifact(job.id, str(paths[0]))
-
+        intake_batch = intake.collect(batch_id)
+        claimed_count = intake_batch.claimed_count
+        failures = [
+            f"{failure.original_locator}: {failure.safe_message}"
+            if failure.original_locator
+            else failure.safe_message
+            for failure in intake_batch.failures
+        ]
+        sources: list[SourceCandidate] = []
+        source_jobs: list[Job] = []
+        queue_path = intake_batch.queue_path
+        queue_job_ids = [
+            success.job.id
+            for success in intake_batch.successes
+            if success.payload.publication_intent.queue_locator
+        ]
         raw_fingerprints: dict[str, tuple[str, str | None]] = {}
-        for job in state.jobs_for_batch(batch_id):
-            if not job.input_artifact:
-                continue
-            artifact = Path(job.input_artifact)
-            raw_fingerprints[job.id] = (str(artifact), html_hash(artifact) if artifact.exists() and artifact.is_file() else None)
-
-        if self.youtube_client:
-            youtube_inputs = self.youtube_client.list_playlist(self.config.youtube_playlist)
-            for video in youtube_inputs:
-                url = f"https://www.youtube.com/watch?v={video.video_id}"
-                key = source_key("youtube", url)
-                job = state.claim("youtube", key, url, input_artifact=video.playlist_item_id, batch_id=batch_id)
-                claimed_count += 1 if job.status != "complete" else 0
-
-        for job in state.jobs_for_batch(batch_id):
-            if job.status != "claimed":
-                continue
+        for success in intake_batch.successes:
+            job = success.job
             try:
-                if job.kind == "article":
-                    current_job = state.get(job.id)
-                    if current_job is None:
-                        raise BatchError(f"claimed job disappeared: {job.id}")
-                    source_payload = self._article_payload(current_job, queue_job_ids, queue_path)
-                    prepared = preparation.prepare(current_job, source_payload)
-                else:
-                    video = next((item for item in youtube_inputs if source_key("youtube", f"https://www.youtube.com/watch?v={item.video_id}") == job.source_key), None)
-                    if video is None:
-                        raise BatchError("YouTube video is not available from the configured client")
-                    current_job = state.get(job.id)
-                    if current_job is None:
-                        raise BatchError(f"claimed job disappeared: {job.id}")
-                    prepared = preparation.prepare(current_job, AcquiredYouTube(video, PublicationIntent(youtube_playlist_item_id=video.playlist_item_id)))
+                current_job = state.get(job.id)
+                if current_job is None:
+                    raise BatchError(f"claimed job disappeared: {job.id}")
+                prepared = preparation.prepare(current_job, success.payload)
                 if isinstance(prepared, PreparationFailure):
                     failures.append(f"{job.original_locator}: {prepared.safe_message}")
                     continue
@@ -223,7 +180,7 @@ class BatchRunner:
             state.fail_batch(batch_id)
             return BatchReport(batch_id=batch_id, claimed=claimed_count, completed=0, failed=len(failures), committed=False, commit_id=None, failures=tuple(failures))
 
-        return self._publish_prepared(_PreparedBatch(state, git, publication, batch_id, sources, source_jobs, queue_path, queue_job_ids, raw_fingerprints, claimed_count, failures, allowed_paths))
+        return self._publish_prepared(_PreparedBatch(state, git, publication, batch_id, sources, source_jobs, queue_path, queue_job_ids, raw_fingerprints, claimed_count, failures, set(intake_batch.allowed_paths)))
 
     def _synthesize(self, batch_id: str, sources: list[SourceCandidate]) -> tuple[ChangeSet, dict, SynthesisFailure | None]:
         """Cross the one typed synthesis seam; no legacy fallback exists."""
@@ -310,7 +267,12 @@ class BatchRunner:
                 state.fail_batch(batch_id)
                 return BatchReport(batch_id=batch_id, claimed=claimed_count, completed=0, failed=len(failures), committed=False, commit_id=None, failures=tuple(failures))
             git.ensure_clean(allowed_paths=allowed_paths)
-            result = publication.publish(batch_id, all_files, changes.deletions, queue_path=str(queue_path.relative_to(self.config.vault)), queue_job_ids=queue_job_ids, source_jobs=source_jobs, raw_fingerprints=raw_fingerprints, synthesis_metadata=synthesis_metadata)
+            youtube_acknowledgements = {
+                source.job_id: source.publication_intent.youtube_playlist_item_id
+                for source in sources
+                if source.publication_intent.youtube_playlist_item_id
+            }
+            result = publication.publish(batch_id, all_files, changes.deletions, queue_path=str(queue_path.relative_to(self.config.vault)), queue_job_ids=queue_job_ids, source_jobs=source_jobs, youtube_acknowledgements=youtube_acknowledgements, raw_fingerprints=raw_fingerprints, synthesis_metadata=synthesis_metadata)
             return self._publication_report(result, state, claimed=claimed_count, completed=len(sources), failed=len(failures), failures=tuple(failures))
         except PublicationCrash:
             raise
@@ -347,41 +309,8 @@ class BatchRunner:
         failures = tuple(job.failure_message for job in jobs if job.failure_message) if not failures else failures
         return BatchReport(batch_id=result.batch_id, claimed=claimed, completed=completed, failed=failed, committed=result.phase in COMMITTED_PUBLICATION_PHASES, commit_id=result.commit_id, failures=failures, publication_phase=result.phase, recovery_action=result.action, recovery_block_reason=(result.failure_code or result.failure_message) if result.phase == PublicationPhase.RECOVERY_BLOCKED else None, publication_failure_code=result.failure_code, publication_failure_message=result.failure_message, outstanding_cleanup=len(state.pending_cleanup()))
 
-    def _article_payload(self, job: Job | None, queue_job_ids: list[str], queue_path: Path) -> AcquiredArticle:
-        if job is None:
-            raise BatchError("job disappeared during processing")
-        input_method = "saved-html"
-        if job.input_artifact:
-            html_text = Path(job.input_artifact).read_text(encoding="utf-8")
-            raw_hash = html_hash(Path(job.input_artifact)) if Path(job.input_artifact).is_file() else None
-        else:
-            input_method = "http"
-            html_text = self.fetcher(job.original_locator)
-            raw_hash = None
-        queued = job.id in queue_job_ids
-        return AcquiredArticle(
-            html_text,
-            input_method,
-            PublicationIntent(
-                queue_path=str(queue_path.relative_to(self.config.vault)) if queued else None,
-                queue_locator=job.original_locator if queued else None,
-                raw_path=job.input_artifact,
-                raw_hash=raw_hash,
-            ),
-        )
-
     def _queue_path(self) -> Path:
-        nested = self.config.to_ingest / "To Ingest.md"
-        return nested if nested.exists() else self.config.vault / "To Ingest.md"
-
-    def _allowed_input_paths(self) -> set[str]:
-        allowed = {str(self._queue_path().relative_to(self.config.vault))}
-        pairing = self.config.to_ingest / "HTML Pairings.yaml"
-        if pairing.exists():
-            allowed.add(str(pairing.relative_to(self.config.vault)))
-        if self.config.to_ingest.exists():
-            allowed.update(str(path.relative_to(self.config.vault)) for path in self.config.to_ingest.iterdir() if path.is_file() and path.suffix.lower() in {".html", ".htm"})
-        return allowed
+        return queue_path_for(self.config)
 
     def _allowed_retry_paths(self, sources: list[SourceCandidate], queue_path: Path) -> set[str]:
         allowed = {str(queue_path.relative_to(self.config.vault))}

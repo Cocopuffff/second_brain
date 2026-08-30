@@ -120,6 +120,9 @@ class Job:
     content_hash: str | None = None
     source_version: int | None = None
     captured_at: str | None = None
+    queue_path: str | None = None
+    queue_locator: str | None = None
+    youtube_playlist_item_id: str | None = None
     queue_acknowledged: bool = False
     cleanup_pending: bool = False
     commit_id: str | None = None

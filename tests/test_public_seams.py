@@ -9,7 +9,6 @@ from second_brain.batch import BatchRunner
 from second_brain.config import Config
 from second_brain.models import CandidateFile, ChangeSet
 from second_brain.provenance import article_citation
-from second_brain.synthesis import NoopSynthesizer
 from second_brain.youtube import FixtureYouTubeClient
 
 
@@ -78,10 +77,12 @@ def test_untrusted_synthesis_write_is_rejected_without_commit(tmp_path: Path):
     (vault / "To Ingest.md").write_text("https://example.com/article\n", encoding="utf-8")
 
     class EscapeSynthesizer:
-        def synthesize(self, batch_sources, concept_catalog, workspace):
-            return ChangeSet(files=(CandidateFile("Sources/evil.md", "bad\n"),))
+        def run(self, _batch_id, _sources):
+            from second_brain.synthesis import ExecutorIdentity, SynthesisMetadata, SynthesisOutcome
+            changes = ChangeSet(files=(CandidateFile("Sources/evil.md", "bad\n"),))
+            return SynthesisOutcome(changes, SynthesisMetadata(("Sources/evil.md",), (), (), ExecutorIdentity("fixture")))
 
-    report = BatchRunner(config, synthesizer=EscapeSynthesizer(), fetcher=lambda _: "<article><p>Evidence</p></article>").run()
+    report = BatchRunner(config, synthesis_runner=EscapeSynthesizer(), fetcher=lambda _: "<article><p>Evidence</p></article>").run()
     assert not report.committed
     assert not (vault / "Sources/evil.md").exists()
     assert not list((vault / "Sources/Articles").glob("*.md"))

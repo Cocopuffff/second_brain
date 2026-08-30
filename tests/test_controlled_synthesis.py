@@ -5,14 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from second_brain.controlled_synthesis import (
+from second_brain.synthesis._boundary import (
     AdapterResult,
     CodexWorkspaceAdapter,
     ControlledSynthesis,
     ProvenanceDeclaration,
     SynthesisFailure,
     codex_sandbox_available,
-    synthesize_controlled,
 )
 from second_brain.models import CandidateFile
 from second_brain.provenance import article_citation
@@ -42,7 +41,7 @@ def test_direct_adapter_only_gets_narrow_reads_and_returns_deterministic_result(
             metadata={"api_key": "must-not-journal", "model": "fixture"},
         )
 
-    result = synthesize_controlled(adapter, [evidence], {}, tmp_path / "candidate")
+    result = ControlledSynthesis(adapter).run([evidence], {}, tmp_path / "candidate")
     assert not isinstance(result, SynthesisFailure)
     assert calls == ["read"]
     assert result.affected_paths == ("Concepts/one.md",)
@@ -51,12 +50,11 @@ def test_direct_adapter_only_gets_narrow_reads_and_returns_deterministic_result(
 
 
 def test_path_collision_rejects_entire_result(tmp_path: Path):
-    result = synthesize_controlled(
+    result = ControlledSynthesis(
         lambda _capabilities: AdapterResult(
             writes=(CandidateFile("Concepts/Café.md", "a\n"), CandidateFile("Concepts/Café.md", "b\n")),
         ),
-        [source()], {}, tmp_path / "candidate",
-    )
+    ).run([source()], {}, tmp_path / "candidate")
     assert isinstance(result, SynthesisFailure)
     assert result.category == "path_collision"
     assert result.change_set is None
@@ -101,22 +99,20 @@ def test_codex_baseline_seed_is_not_reported_as_a_write(tmp_path: Path):
 
 def test_raw_dot_and_repeated_separator_paths_are_rejected(tmp_path: Path):
     for path in ("Concepts/./one.md", "Concepts//one.md"):
-        result = synthesize_controlled(
+        result = ControlledSynthesis(
             lambda _capabilities, path=path: AdapterResult(writes=(CandidateFile(path, "one\n"),)),
-            [source()], {}, tmp_path / path.replace("/", "_")
-        )
+        ).run([source()], {}, tmp_path / path.replace("/", "_"))
         assert isinstance(result, SynthesisFailure)
         assert result.category == "invalid_operation"
 
 
 def test_undeclared_citation_is_rejected(tmp_path: Path):
     evidence = source()
-    result = synthesize_controlled(
+    result = ControlledSynthesis(
         lambda _capabilities: AdapterResult(
             writes=(CandidateFile("Concepts/one.md", f"Interpretation\n\n{article_citation('One', evidence.relative_path, 1, 2)}\n"),),
         ),
-        [evidence], {}, tmp_path / "candidate"
-    )
+    ).run([evidence], {}, tmp_path / "candidate")
 
     assert isinstance(result, SynthesisFailure)
     assert result.category == "invalid_provenance"
@@ -124,13 +120,12 @@ def test_undeclared_citation_is_rejected(tmp_path: Path):
 
 def test_versionless_provenance_is_rejected(tmp_path: Path):
     evidence = source()
-    result = synthesize_controlled(
+    result = ControlledSynthesis(
         lambda _capabilities: AdapterResult(
             writes=(CandidateFile("Concepts/one.md", f"Interpretation\n\n{article_citation('One', evidence.relative_path, 1, 2)}\n"),),
             provenance=(ProvenanceDeclaration("Concepts/one.md", 0, evidence.source_id),),
         ),
-        [evidence], {}, tmp_path / "candidate"
-    )
+    ).run([evidence], {}, tmp_path / "candidate")
 
     assert isinstance(result, SynthesisFailure)
     assert result.category == "invalid_provenance"

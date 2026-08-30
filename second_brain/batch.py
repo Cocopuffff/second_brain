@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import fcntl
-import json
 import urllib.request
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
 
 from .canonical import source_key, stable_id
 from .config import Config
@@ -18,10 +16,9 @@ from .publication import BatchPublication, PublicationCrash, PublicationError, P
 from .queue import claim_article_queue, remove_claimed_urls_text
 from .render import render_markdown, render_source
 from .state import StateStore
-from .synthesis import NoopSynthesizer
-from .validation import ValidationError, validate_changes, validate_markdown
+from .synthesis import ExecutorIdentity, FailureCategory, SynthesisFailure, SynthesisOutcome, SynthesisRunner, build_controlled_synthesis
+from .validation import ValidationError, validate_markdown
 from .youtube import YouTubeClient, render_video_source
-from .controlled_synthesis import ControlledSynthesis, SynthesisFailure, SynthesisOutcome
 
 
 class BatchError(RuntimeError):
@@ -43,9 +40,9 @@ def single_process_lock(path: Path):
 
 
 class BatchRunner:
-    def __init__(self, config: Config, *, synthesizer: Any | None = None, image_processor: ImageProcessor | None = None, youtube_client: YouTubeClient | None = None, fetcher=None, _publication_faults: PublicationFaults | None = None):
+    def __init__(self, config: Config, *, synthesis_runner: SynthesisRunner | None = None, image_processor: ImageProcessor | None = None, youtube_client: YouTubeClient | None = None, fetcher=None, _publication_faults: PublicationFaults | None = None):
         self.config = config
-        self.synthesizer = synthesizer or NoopSynthesizer()
+        self.synthesis_runner = synthesis_runner or build_controlled_synthesis(config)
         self.image_processor = image_processor
         self.youtube_client = youtube_client
         self.fetcher = fetcher or self._fetch
@@ -192,12 +189,10 @@ class BatchRunner:
             state.fail_batch(batch_id)
             return BatchReport(batch_id=batch_id, claimed=claimed_count, completed=0, failed=len(failures), committed=False, commit_id=None, failures=tuple(failures))
 
-        concept_catalog = self._concept_catalog()
-        staging = self.config.state_dir / "staging" / batch_id
         try:
-            changes, synthesis_metadata, synthesis_failure = self._synthesize(sources, concept_catalog, staging)
+            changes, synthesis_metadata, synthesis_failure = self._synthesize(batch_id, sources)
             if synthesis_failure:
-                failures.append(f"{synthesis_failure.category}: {synthesis_failure.message}")
+                failures.append(f"{synthesis_failure.category}: {synthesis_failure.safe_message}")
                 state.fail_batch(batch_id)
                 return BatchReport(batch_id=batch_id, claimed=claimed_count, completed=0, failed=len(failures), committed=False, commit_id=None, failures=tuple(failures))
             source_files = {source.relative_path: render_markdown(source) for source in sources}
@@ -241,70 +236,17 @@ class BatchRunner:
             report_failure = journal is not None or publication_error
             return BatchReport(batch_id=batch_id, claimed=claimed_count, completed=0, failed=len(failures), committed=False, commit_id=commit_id, failures=tuple(failures), publication_phase=phase, recovery_action="publication_failed" if report_failure else None, publication_failure_code=failure_code if report_failure else None, publication_failure_message=failure_message if report_failure else None, outstanding_cleanup=len(state.pending_cleanup()))
 
-    def _synthesize(self, sources: list[SourceDocument], concept_catalog: dict[str, str], staging: Path) -> tuple[ChangeSet, dict[str, Any], SynthesisFailure | None]:
-        """Cross the controlled boundary once, retaining its validated handoff."""
-        adapter = self.synthesizer
-        if isinstance(adapter, ControlledSynthesis) or (hasattr(adapter, "run") and not hasattr(adapter, "synthesize")) or hasattr(adapter, "execute"):
-            committed_sources = self._committed_sources()
-            runner = adapter if isinstance(adapter, ControlledSynthesis) or (hasattr(adapter, "run") and not hasattr(adapter, "synthesize")) else ControlledSynthesis(adapter)
-            result = runner.run(sources, concept_catalog, staging, vault=self.config.vault, committed_sources=committed_sources)
-        else:
-            # Compatibility for third-party legacy test doubles.  Production
-            # adapters are wrapped above and never use this path.
-            changes = adapter.synthesize(sources, concept_catalog, staging)
-            validate_changes(changes, sources, self.config.vault)
-            return changes, dict(changes.metadata), None
+    def _synthesize(self, batch_id: str, sources: list[SourceDocument]) -> tuple[ChangeSet, dict, SynthesisFailure | None]:
+        """Cross the one typed synthesis seam; no legacy fallback exists."""
+        try:
+            result = self.synthesis_runner.run(batch_id, sources)
+        except Exception:
+            return ChangeSet(), {}, SynthesisFailure(FailureCategory.ADAPTER_EXECUTION_FAILURE, "controlled synthesis failed", ExecutorIdentity("unknown"))
         if isinstance(result, SynthesisFailure):
             return ChangeSet(), {}, result
         if not isinstance(result, SynthesisOutcome):
             raise BatchError("controlled synthesis returned an invalid result")
-        return result.change_set, dict(result.change_set.metadata), None
-
-    def _committed_sources(self) -> list[SourceDocument]:
-        """Read only the immutable, rendered source versions already in the vault."""
-        committed: list[SourceDocument] = []
-        if not self.config.sources.exists():
-            return committed
-        for path in sorted(self.config.sources.rglob("*.md")):
-            if path.is_symlink() or not path.is_file():
-                raise BatchError(f"committed source is not a regular file: {path}")
-            text = path.read_text(encoding="utf-8")
-            if not text.startswith("---\n") or "\n---\n" not in text:
-                raise BatchError(f"committed source has invalid frontmatter: {path}")
-            header, rendered_body = text[4:].split("\n---\n", 1)
-            metadata: dict[str, object] = {}
-            for line in header.splitlines():
-                if ":" not in line:
-                    raise BatchError(f"committed source has invalid metadata: {path}")
-                key, raw = line.split(":", 1)
-                try:
-                    metadata[key] = None if raw.strip() == "null" else json.loads(raw.strip())
-                except (TypeError, ValueError) as exc:
-                    raise BatchError(f"committed source has invalid metadata: {path}") from exc
-            title = str(metadata.get("title", ""))
-            marker = f"# {title}\n\n"
-            if not rendered_body.startswith(marker):
-                raise BatchError(f"committed source body does not match its title: {path}")
-            content = rendered_body[len(marker):]
-            kind = str(metadata.get("source_type", ""))
-            if kind not in {"article", "youtube"}:
-                raise BatchError(f"committed source has invalid type: {path}")
-            try:
-                source_version = int(metadata["immutable_source_version"])
-                source_id = str(metadata["source_id"])
-                kind = str(metadata["source_type"])
-                canonical_url = str(metadata["canonical_url"])
-                content_hash = str(metadata["content_hash"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise BatchError(f"committed source is missing immutable identity: {path}") from exc
-            try:
-                candidate = render_source(source_id=source_id, kind=kind, canonical_url=canonical_url, title=title, body=content, author=metadata.get("author"), publication_date=metadata.get("publication_date"), captured_at=str(metadata["captured_at"]), input_method=str(metadata["input_method"]), source_version=source_version)
-            except (KeyError, TypeError, ValueError) as exc:
-                raise BatchError(f"committed source cannot be deterministically rendered: {path}") from exc
-            if candidate.relative_path != str(path.relative_to(self.config.vault)) or candidate.content_hash != content_hash or render_markdown(candidate) != text:
-                raise BatchError(f"committed source identity or rendering mismatch: {path}")
-            committed.append(candidate)
-        return committed
+        return result.change_set, result.metadata.as_dict(), None
 
     @staticmethod
     def _publication_report(result, state: StateStore, *, claimed: int = 0, completed: int | None = None, failed: int | None = None, failures: tuple[str, ...] = ()) -> BatchReport:
@@ -326,14 +268,6 @@ class BatchRunner:
         extracted = extract_article(html_text, self.image_processor)
         source_id = stable_id("article", job.source_key)
         return render_source(source_id=source_id, kind="article", canonical_url=job.original_locator, title=extracted["title"], body=extracted["body"], author=None, publication_date=None, captured_at=job.captured_at or utc_now(), input_method=input_method, source_version=job.source_version or 1)
-
-    def _concept_catalog(self) -> dict[str, str]:
-        result: dict[str, str] = {}
-        if not self.config.concepts.exists():
-            return result
-        for path in sorted(self.config.concepts.rglob("*.md")):
-            result[str(path.relative_to(self.config.vault))] = path.read_text(encoding="utf-8")[:12000]
-        return result
 
     def _queue_path(self) -> Path:
         nested = self.config.to_ingest / "To Ingest.md"

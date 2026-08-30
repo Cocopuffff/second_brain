@@ -8,10 +8,10 @@ import pytest
 
 from second_brain.batch import BatchError, BatchRunner
 from second_brain.cli import main
-from second_brain.controlled_synthesis import ControlledSynthesis
 from second_brain.config import Config
 from second_brain.models import CandidateFile, ChangeSet
 from second_brain.publication import PublicationCrash
+from second_brain.synthesis import ExecutorIdentity, FailureCategory, SynthesisFailure, SynthesisMetadata, SynthesisOutcome
 
 
 def _git_repo(path: Path) -> None:
@@ -32,6 +32,27 @@ def _vault(tmp_path: Path, queue: str = "https://example.com/article\n") -> tupl
 
 def _commits(vault: Path) -> int:
     return int(subprocess.run(["git", "rev-list", "--count", "HEAD"], cwd=vault, text=True, capture_output=True, check=True).stdout)
+
+
+def _fixture_runner(build_changes):
+    class FixtureRunner:
+        def run(self, _batch_id, sources):
+            try:
+                changes = build_changes(sources)
+            except Exception:
+                return SynthesisFailure(FailureCategory.ADAPTER_EXECUTION_FAILURE, "fixture synthesis failed", ExecutorIdentity("fixture"))
+            affected = tuple(sorted({item.relative_path for item in changes.files} | set(changes.deletions)))
+            return SynthesisOutcome(changes, SynthesisMetadata(affected, tuple(sorted(changes.deletions)), (), ExecutorIdentity("fixture", "fixture")))
+
+    return FixtureRunner()
+
+
+def _failure_runner(category: FailureCategory):
+    class FixtureRunner:
+        def run(self, _batch_id, _sources):
+            return SynthesisFailure(category, "fixture synthesis failed", ExecutorIdentity("fixture"))
+
+    return FixtureRunner()
 
 
 class CrashAt:
@@ -108,10 +129,10 @@ def test_successful_publication_commits_exact_validated_paths(tmp_path: Path):
     subprocess.run(["git", "commit", "-qm", "concept fixture"], cwd=vault, check=True)
 
     class ConceptChanges:
-        def synthesize(self, batch_sources, concept_catalog, workspace):
+        def build(self, _sources):
             return ChangeSet(files=(CandidateFile("Concepts/new.md", "new concept\n"),), deletions=("Concepts/removed.md",))
 
-    report = BatchRunner(config, synthesizer=ConceptChanges()).run()
+    report = BatchRunner(config, synthesis_runner=_fixture_runner(ConceptChanges().build)).run()
 
     assert report.commit_id
     source = next((vault / "Sources").rglob("*.md"))
@@ -126,10 +147,10 @@ def test_synthesis_failure_prevents_publication(tmp_path: Path):
     raw = _saved_html(vault, "saved.html", "https://example.com/saved")
 
     class FailedSynthesis:
-        def synthesize(self, batch_sources, concept_catalog, workspace):
+        def build(self, _sources):
             raise RuntimeError("fixture synthesis failure")
 
-    report = BatchRunner(config, synthesizer=FailedSynthesis()).run()
+    report = BatchRunner(config, synthesis_runner=_fixture_runner(FailedSynthesis().build)).run()
 
     assert not report.committed
     assert _commits(vault) == 1
@@ -141,11 +162,11 @@ def test_synthesis_failure_prevents_publication(tmp_path: Path):
 def test_controlled_outcome_reaches_publication_with_validated_metadata(tmp_path: Path):
     vault, config = _vault(tmp_path)
 
-    controlled = ControlledSynthesis(
-        lambda _capabilities: {"writes": [{"path": "Concepts/controlled.md", "content": "# New\n"}], "metadata": {"model": "fixture"}},
-        executor={"kind": "fixture", "version": "1"},
-    )
-    report = BatchRunner(config, synthesizer=controlled, fetcher=lambda _: "<article><p>Evidence.</p></article>").run()
+    report = BatchRunner(
+        config,
+        synthesis_runner=_fixture_runner(lambda _sources: ChangeSet(files=(CandidateFile("Concepts/controlled.md", "# New\n"),))),
+        fetcher=lambda _: "<article><p>Evidence.</p></article>",
+    ).run()
 
     assert report.committed
     workspace = _publication_workspace(config)
@@ -156,11 +177,11 @@ def test_controlled_outcome_reaches_publication_with_validated_metadata(tmp_path
 
 def test_controlled_failure_returns_without_publication(tmp_path: Path):
     vault, config = _vault(tmp_path)
-    controlled = ControlledSynthesis(
-        lambda _capabilities: {"writes": [{"path": "Sources/escape.md", "content": "bad\n"}]},
-        executor={"kind": "fixture", "version": "1"},
-    )
-    report = BatchRunner(config, synthesizer=controlled, fetcher=lambda _: "<article><p>Evidence.</p></article>").run()
+    report = BatchRunner(
+        config,
+        synthesis_runner=_failure_runner(FailureCategory.OUT_OF_SCOPE_CHANGE),
+        fetcher=lambda _: "<article><p>Evidence.</p></article>",
+    ).run()
 
     assert not report.committed
     assert any("out_of_scope_change" in failure for failure in report.failures)
@@ -267,14 +288,14 @@ def test_each_file_publication_boundary_restores_a_mixed_candidate(tmp_path: Pat
     subprocess.run(["git", "commit", "-qm", "concept fixtures"], cwd=vault, check=True)
 
     class MixedConcepts:
-        def synthesize(self, batch_sources, concept_catalog, workspace):
+        def build(self, _sources):
             return ChangeSet(
                 files=(CandidateFile("Concepts/new.md", "new\n"), CandidateFile("Concepts/overwritten.md", "overwrite after\n")),
                 deletions=("Concepts/deleted.md",),
             )
 
     with pytest.raises(PublicationCrash):
-        BatchRunner(config, synthesizer=MixedConcepts(), _publication_faults=CrashAt("file_published", occurrence)).run()
+        BatchRunner(config, synthesis_runner=_fixture_runner(MixedConcepts().build), _publication_faults=CrashAt("file_published", occurrence)).run()
 
     assert raw.exists()
     report = BatchRunner(config).run()
@@ -386,10 +407,10 @@ def test_candidate_path_escape_is_rejected(tmp_path: Path, candidate_path: str):
     vault, config = _vault(tmp_path)
 
     class EscapeSynthesizer:
-        def synthesize(self, batch_sources, concept_catalog, workspace):
+        def build(self, _sources):
             return ChangeSet(files=(CandidateFile(candidate_path, "bad\n"),))
 
-    report = BatchRunner(config, synthesizer=EscapeSynthesizer(), fetcher=lambda _: "<article><p>Evidence.</p></article>").run()
+    report = BatchRunner(config, synthesis_runner=_fixture_runner(EscapeSynthesizer().build), fetcher=lambda _: "<article><p>Evidence.</p></article>").run()
 
     assert not report.committed
     assert not (tmp_path / "escape.md").exists()
@@ -398,11 +419,7 @@ def test_candidate_path_escape_is_rejected(tmp_path: Path, candidate_path: str):
 def test_duplicate_candidate_paths_are_rejected(tmp_path: Path):
     vault, config = _vault(tmp_path)
 
-    class DuplicateSynthesizer:
-        def synthesize(self, batch_sources, concept_catalog, workspace):
-            return ChangeSet(files=(CandidateFile("Concepts/a.md", "one\n"), CandidateFile("Concepts/a.md", "two\n")))
-
-    report = BatchRunner(config, synthesizer=DuplicateSynthesizer(), fetcher=lambda _: "<article><p>Evidence.</p></article>").run()
+    report = BatchRunner(config, synthesis_runner=_failure_runner(FailureCategory.PATH_COLLISION), fetcher=lambda _: "<article><p>Evidence.</p></article>").run()
 
     assert not report.committed
 
@@ -445,10 +462,10 @@ def test_live_vault_symlink_blocks_publication(tmp_path: Path):
     subprocess.run(["git", "commit", "-qm", "symlink fixture"], cwd=vault, check=True)
 
     class LinkedConcept:
-        def synthesize(self, batch_sources, concept_catalog, workspace):
+        def build(self, _sources):
             return ChangeSet(files=(CandidateFile("Concepts/linked/new.md", "unsafe\n"),))
 
-    report = BatchRunner(config, synthesizer=LinkedConcept(), fetcher=lambda _: "<article><p>Evidence.</p></article>").run()
+    report = BatchRunner(config, synthesis_runner=_fixture_runner(LinkedConcept().build), fetcher=lambda _: "<article><p>Evidence.</p></article>").run()
 
     assert not report.committed
     assert report.publication_failure_code == "symlink_escape"
@@ -465,11 +482,11 @@ def test_rollback_payload_symlink_blocks_recovery(tmp_path: Path):
     subprocess.run(["git", "commit", "-qm", "concept fixture"], cwd=vault, check=True)
 
     class OverwriteConcept:
-        def synthesize(self, batch_sources, concept_catalog, workspace):
+        def build(self, _sources):
             return ChangeSet(files=(CandidateFile("Concepts/existing.md", "after\n"),))
 
     with pytest.raises(PublicationCrash):
-        BatchRunner(config, synthesizer=OverwriteConcept(), fetcher=lambda _: "<article><p>Evidence.</p></article>", _publication_faults=CrashAt("snapshot_captured")).run()
+        BatchRunner(config, synthesis_runner=_fixture_runner(OverwriteConcept().build), fetcher=lambda _: "<article><p>Evidence.</p></article>", _publication_faults=CrashAt("snapshot_captured")).run()
 
     workspace = _publication_workspace(config)
     payload = workspace / "rollback" / "payload"
@@ -561,11 +578,11 @@ def test_deletion_is_committed_and_rollback_restores_deleted_file(tmp_path: Path
     subprocess.run(["git", "commit", "-qm", "concept fixture"], cwd=vault, check=True)
 
     class DeleteConcept:
-        def synthesize(self, batch_sources, concept_catalog, workspace):
+        def build(self, _sources):
             return ChangeSet(deletions=("Concepts/old.md",))
 
     with pytest.raises(PublicationCrash):
-        BatchRunner(config, synthesizer=DeleteConcept(), fetcher=lambda _: "<article><p>Evidence.</p></article>", _publication_faults=CrashAt("file_published")).run()
+        BatchRunner(config, synthesis_runner=_fixture_runner(DeleteConcept().build), fetcher=lambda _: "<article><p>Evidence.</p></article>", _publication_faults=CrashAt("file_published")).run()
     recovery = BatchRunner(config, fetcher=lambda _: "<article><p>Evidence.</p></article>").run()
 
     assert recovery.publication_phase == "rolled_back"
@@ -580,11 +597,7 @@ def test_source_deletion_requested_by_synthesis_is_rejected(tmp_path: Path):
     subprocess.run(["git", "add", "."], cwd=vault, check=True)
     subprocess.run(["git", "commit", "-qm", "source fixture"], cwd=vault, check=True)
 
-    class DeleteSource:
-        def synthesize(self, batch_sources, concept_catalog, workspace):
-            return ChangeSet(deletions=("Sources/Articles/old.md",))
-
-    report = BatchRunner(config, synthesizer=DeleteSource(), fetcher=lambda _: "<article><p>Evidence.</p></article>").run()
+    report = BatchRunner(config, synthesis_runner=_failure_runner(FailureCategory.OUT_OF_SCOPE_CHANGE), fetcher=lambda _: "<article><p>Evidence.</p></article>").run()
 
     assert not report.committed
     assert old_source.read_text(encoding="utf-8") == "old source\n"
@@ -653,15 +666,15 @@ def test_multiple_raw_payloads_recover_without_recommit_or_resynthesis(tmp_path:
     class CountingSynthesis:
         calls = 0
 
-        def synthesize(self, batch_sources, concept_catalog, workspace):
+        def build(self, _sources):
             type(self).calls += 1
             return ChangeSet()
 
     with pytest.raises(PublicationCrash):
-        BatchRunner(config, synthesizer=CountingSynthesis(), _publication_faults=CrashAt("raw_payload_removed")).run()
+        BatchRunner(config, synthesis_runner=_fixture_runner(CountingSynthesis().build), _publication_faults=CrashAt("raw_payload_removed")).run()
 
     before = _commits(vault)
-    report = BatchRunner(config, synthesizer=CountingSynthesis()).run()
+    report = BatchRunner(config, synthesis_runner=_fixture_runner(CountingSynthesis().build)).run()
 
     assert report.publication_phase == "complete"
     assert report.outstanding_cleanup == 0

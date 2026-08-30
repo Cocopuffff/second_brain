@@ -7,12 +7,11 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .batch import BatchError, BatchRunner
-from .controlled_synthesis import CodexWorkspaceAdapter, ControlledSynthesis
 from .config import Config
 from .git_ops import GitError, GitRepository
 from .models import PublicationPhase, UNCOMMITTED_PUBLICATION_PHASES
 from .state import StateStore
-from .synthesis import DeepSeekSynthesizer, NoopSynthesizer
+from .synthesis import build_controlled_synthesis
 from .youtube import FixtureYouTubeClient
 
 
@@ -21,15 +20,7 @@ def _config(args) -> Config:
 
 
 def _runner(config: Config) -> BatchRunner:
-    if config.executor == "deepseek":
-        adapter = DeepSeekSynthesizer(api_key=None, base_url=config.deepseek_base_url, model=config.deepseek_model, timeout=config.request_timeout)
-        synthesizer = ControlledSynthesis(adapter, executor={"kind": "deepseek", "model": config.deepseek_model, "version": "1"})
-    elif config.executor == "codex":
-        adapter = CodexWorkspaceAdapter(list(config.codex_command), timeout=config.request_timeout)
-        synthesizer = ControlledSynthesis(adapter, executor={"kind": "codex", "version": "1"})
-    else:
-        synthesizer = ControlledSynthesis(NoopSynthesizer(), executor={"kind": "noop", "version": "1"})
-    return BatchRunner(config, synthesizer=synthesizer)
+    return BatchRunner(config, synthesis_runner=build_controlled_synthesis(config))
 
 
 def _publication_statuses(config: Config, state: StateStore) -> list[dict]:
@@ -74,8 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config = _config(args)
-    runner = _runner(config)
     try:
+        runner = _runner(config)
         if args.command == "init":
             runner.initialize()
             print(json.dumps({"initialized": True, "vault": str(config.vault), "state_dir": str(config.state_dir)}))
@@ -105,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
             report = runner.run()
             print(json.dumps(report.__dict__, ensure_ascii=False))
             return 2 if report.recovery_block_reason else (0 if report.committed or report.claimed == 0 else 1)
-    except BatchError as exc:
+    except (BatchError, ValueError) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
         return 2
     return 2

@@ -19,7 +19,19 @@ Before a real batch, open Obsidian, wait for Obsidian Sync to finish, and avoid 
 
 ## Executors and evidence
 
-The default `noop` executor prepares sources without concept changes. The DeepSeek adapter uses the configurable OpenAI-compatible `/chat/completions` endpoint with JSON output. Set `DEEPSEEK_API_KEY` outside the vault and configure the model in JSON rather than storing credentials in the repository. The Codex adapter accepts a command that reads the synthesis request as JSON on stdin and returns a JSON change set on stdout; its validated writes are still restricted to `Concepts/`.
+The default `noop` executor prepares sources without concept changes. The DeepSeek adapter requires an explicit `deepseek_model`, starts with descriptors rather than evidence bodies, and uses a bounded four-tool loop (`list_concepts`, `read_concept`, `search_concepts`, and `read_source`). Set `DEEPSEEK_API_KEY` outside the vault and configure the model in JSON rather than storing credentials in the repository. Codex is CLI-only: configure `codex_executable` and optionally `codex_model`. The runner invokes `codex exec` with its native workspace-write sandbox, no approvals, ephemeral state, ignored user config/rules, strict config, a fixed candidate directory, and schema-validated output. The old `codex_command` setting is rejected with a migration error.
+
+For example, a DeepSeek configuration must name the provider model explicitly:
+
+```json
+{"executor": "deepseek", "deepseek_model": "<supported-model>"}
+```
+
+The equivalent Codex configuration is:
+
+```json
+{"executor": "codex", "codex_executable": "codex", "codex_model": "<optional-model>"}
+```
 
 Image interpretation is a separate adapter. The safe default retains a meaningful image only when its caption or alt text is evidence; a configured processor can describe an image in place. Image bytes are never copied into `Sources/`.
 

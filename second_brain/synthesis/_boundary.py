@@ -18,8 +18,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Protocol
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .models import CandidateFile, ChangeSet, SourceDocument
-from .render import render_markdown
+from ..models import CandidateFile, ChangeSet, SourceDocument
+from ..render import render_markdown
 
 
 FAILURE_CATEGORIES = frozenset({
@@ -189,8 +189,8 @@ def _regular_tree(root: Path) -> dict[str, bytes]:
         if stat.S_ISLNK(mode):
             raise SynthesisValidationError("symlink_escape", f"symlink in candidate workspace: {relative}")
         if path.is_dir():
-            if relative.startswith("Concepts/") and relative != "Concepts" and not any(path.iterdir()):
-                raise SynthesisValidationError("workspace_contamination", f"empty directory in Concepts/: {relative}")
+            if relative != "Concepts" and not any(path.iterdir()):
+                raise SynthesisValidationError("workspace_contamination", f"empty directory in candidate workspace: {relative}")
             continue
         if not stat.S_ISREG(mode):
             raise SynthesisValidationError("workspace_contamination", f"non-regular workspace entry: {relative}")
@@ -246,6 +246,7 @@ class ControlledSynthesis:
                 # The baseline is part of the candidate, not an executor
                 # change.  Seed it before taking the comparison snapshot.
                 self.adapter.seed_workspace(concept_catalog, workspace, batch_sources=batch_sources)
+                self.adapter.prepare_context(batch_sources, concept_catalog, workspace, vault)
             workspace_before = _regular_tree(workspace)
             sources: dict[str, SourceDocument] = {}
             for source in [*batch_sources, *committed_sources]:
@@ -264,37 +265,19 @@ class ControlledSynthesis:
                 search_concepts=lambda query: tuple(item for item in concepts if query.casefold() in (item.title + " " + " ".join(item.aliases)).casefold())[: self.max_search_results],
                 read_source=lambda identifier: self._read_source(identifier, sources),
             )
-            if hasattr(self.adapter, "set_source_versions"):
-                self.adapter.set_source_versions(tuple(sorted(sources)))
-            if hasattr(self.adapter, "execute"):
-                if not getattr(self.adapter, "requires_context", False):
-                    raw = self.adapter.execute(capabilities)
-                elif isinstance(self.adapter, CodexWorkspaceAdapter):
-                    raw = self.adapter.execute(batch_sources, concept_catalog, workspace, vault=vault)
-                else:
-                    raw = self.adapter.execute(batch_sources, concept_catalog, workspace)
-            else:
+            if isinstance(self.adapter, CodexWorkspaceAdapter):
+                raw = self.adapter.execute(capabilities)
+            elif callable(self.adapter):
                 raw = self.adapter(capabilities)
+            else:
+                self.adapter.set_source_versions(tuple(sorted(sources)))
+                raw = self.adapter.execute(capabilities)
             result = _strict_adapter_result(raw)
             if isinstance(self.adapter, CodexWorkspaceAdapter):
                 result = self._codex_result(result, workspace, workspace_before, vault)
             return self._validate(result, sources, concepts, workspace, vault)
         except Exception as exc:
             return _failure(self.executor.get("kind", "unknown"), exc)
-
-    execute = run
-
-    def synthesize(self, batch_sources: list[SourceDocument], concept_catalog: Mapping[str, Any], workspace: Path) -> ChangeSet:
-        """Compatibility adapter for the existing batch runner.
-
-        New callers should use :meth:`run` so structured failures remain
-        observable.  The legacy seam receives no publishable change set when
-        validation fails.
-        """
-        result = self.run(batch_sources, concept_catalog, workspace)
-        if isinstance(result, SynthesisFailure):
-            raise SynthesisValidationError(result.category, result.message)
-        return result.change_set
 
     def _catalog(self, catalog: Mapping[str, Any], vault: Path | None):
         concepts: list[ConceptDescriptor] = []
@@ -356,8 +339,10 @@ class ControlledSynthesis:
         writes = tuple(writes)
         deletions = tuple(f"Concepts/{path}" for path in sorted(changed) if path in before and path not in after)
         actual = {item.relative_path for item in writes} | set(deletions)
-        claimed_paths = {item.relative_path for item in claimed.writes} | set(claimed.deletions)
-        if claimed.claims_present and claimed_paths != actual:
+        claimed_writes = {item.relative_path: item.content for item in claimed.writes}
+        actual_writes = {item.relative_path: item.content for item in writes}
+        claimed_paths = set(claimed_writes) | set(claimed.deletions)
+        if claimed.claims_present and (claimed_paths != actual or claimed_writes != actual_writes or set(claimed.deletions) != set(deletions)):
             raise SynthesisValidationError("malformed_executor_output", "Codex output does not match candidate workspace diff")
         return AdapterResult(writes, deletions, claimed.provenance, claimed.metadata, claimed.claims_present)
 
@@ -433,13 +418,33 @@ class ControlledSynthesis:
 
 
 class CodexWorkspaceAdapter:
-    """Run a command in a candidate workspace; stdout is only optional metadata."""
+    """Run Codex CLI in a native workspace-write candidate sandbox.
+
+    A list command remains accepted for deterministic in-process fixtures; the
+    production factory passes a single executable name and therefore always
+    constructs the fixed Codex CLI invocation below.
+    """
     requires_context = True
 
-    def __init__(self, command: list[str], *, timeout: int = 600, executor_version: str = "1"):
-        self.command = list(command)
+    def __init__(self, command: str | list[str], *, model: str | None = None, timeout: int = 600, executor_version: str = "1"):
+        self.command = [command] if isinstance(command, str) else list(command)
+        self.native_cli = isinstance(command, str)
+        self.model = model
         self.timeout = timeout
         self.executor_version = executor_version
+        self._batch_sources = ()
+        self._concept_catalog = {}
+        self._workspace: Path | None = None
+        self._vault: Path | None = None
+
+    def set_source_versions(self, _source_versions: tuple[str, ...]) -> None:
+        return None
+
+    def prepare_context(self, batch_sources, concept_catalog, workspace: Path, vault: Path | None) -> None:
+        self._batch_sources = tuple(batch_sources)
+        self._concept_catalog = concept_catalog
+        self._workspace = workspace
+        self._vault = vault
 
     def seed_workspace(self, concept_catalog, workspace: Path, *, batch_sources=()) -> None:
         workspace.mkdir(parents=True, exist_ok=True)
@@ -452,7 +457,11 @@ class CodexWorkspaceAdapter:
             raise SynthesisValidationError("workspace_contamination", "candidate Concepts entry is not a directory")
         concepts_root.mkdir(exist_ok=True)
         for relative, value in concept_catalog.items():
-            if not isinstance(relative, str) or not isinstance(value, str):
+            if not isinstance(relative, str):
+                continue
+            if isinstance(value, Mapping):
+                value = value.get("content", "")
+            if not isinstance(value, str):
                 continue
             _normalized, target = _candidate_path(relative, workspace)
             if target.exists():
@@ -472,12 +481,35 @@ class CodexWorkspaceAdapter:
             target.write_text(source.content, encoding="utf-8")
             source_manifest[key] = filename
         (inputs / "sources.json").write_text(json.dumps(source_manifest, sort_keys=True) + "\n", encoding="utf-8")
+        if self.native_cli:
+            self._write_schema(workspace / ".synthesis-output-schema.json")
 
-    def execute(self, batch_sources, concept_catalog, workspace, *, vault: Path | None = None):
-        self.seed_workspace(concept_catalog, workspace, batch_sources=batch_sources)
-        payload = json.dumps({"sources": [{"source_id": item.source_id, "source_version": item.source_version, "title": item.title, "read_file": f"Inputs/{hashlib.sha256(_source_version_key(item).encode('utf-8')).hexdigest()}.md"} for item in batch_sources], "concepts": [{"path": path} for path in sorted(concept_catalog)], "write_scope": "Concepts/", "read_scope": "Inputs/"}, ensure_ascii=False)
+    def preflight(self) -> None:
+        if not self.native_cli:
+            return
+        executable = self.command[0]
+        if shutil.which(executable) is None and not Path(executable).is_file():
+            raise SynthesisValidationError("adapter_execution_failure", "Codex executable is unavailable")
         try:
-            process = subprocess.run(_sandboxed_command(self.command, workspace, vault), input=payload, text=True, capture_output=True, cwd=workspace, timeout=self.timeout, check=True, env=_sandbox_environment())
+            result = subprocess.run([executable, "exec", "--help"], capture_output=True, text=True, timeout=10, check=True, env=_sandbox_environment())
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SynthesisValidationError("adapter_execution_failure", "Codex CLI preflight failed") from exc
+        help_text = (result.stdout or "") + (result.stderr or "")
+        required = ("--sandbox", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--strict-config", "--output-schema")
+        if any(flag not in help_text for flag in required):
+            raise SynthesisValidationError("adapter_execution_failure", "Codex CLI does not expose the required safety flags")
+
+    def execute(self, _capabilities):
+        batch_sources = self._batch_sources
+        concept_catalog = self._concept_catalog
+        workspace = self._workspace
+        vault = self._vault
+        if workspace is None:
+            raise SynthesisValidationError("adapter_execution_failure", "Codex candidate workspace was not prepared")
+        payload = json.dumps({"sources": [{"source_id": item.source_id, "source_version": item.source_version, "title": item.title, "read_file": f"Inputs/{hashlib.sha256(_source_version_key(item).encode('utf-8')).hexdigest()}.md"} for item in batch_sources], "concepts": [{"path": path} for path in sorted(concept_catalog)], "write_scope": "Concepts/", "read_scope": "Inputs/"}, ensure_ascii=False)
+        command = self._invocation(workspace) if self.native_cli else _sandboxed_command(self.command, workspace, vault)
+        try:
+            process = subprocess.run(command, input=payload, text=True, capture_output=True, cwd=workspace, timeout=self.timeout, check=True, env=_sandbox_environment())
         except subprocess.TimeoutExpired as exc:
             raise SynthesisValidationError("timeout", "Codex adapter timed out") from exc
         except subprocess.CalledProcessError as exc:
@@ -499,7 +531,29 @@ class CodexWorkspaceAdapter:
         else:
             provenance = []
             claims_present = False
-        return AdapterResult((), (), tuple(provenance), {"kind": "codex", "version": self.executor_version, **metadata}, claims_present)
+        return AdapterResult(tuple(parsed.writes) if process.stdout.strip() else (), tuple(parsed.deletions) if process.stdout.strip() else (), tuple(provenance), {"kind": "codex", "version": self.executor_version, **metadata}, claims_present)
+
+    def _invocation(self, workspace: Path) -> list[str]:
+        schema = workspace / ".synthesis-output-schema.json"
+        if not schema.exists():
+            self._write_schema(schema)
+        command = [self.command[0], "exec", "--sandbox", "workspace-write", "-c", 'approval_policy="never"', "--ephemeral", "--ignore-user-config", "--ignore-rules", "--strict-config", "--skip-git-repo-check", "-C", str(workspace), "--output-schema", str(schema)]
+        if self.model:
+            command.extend(["--model", self.model])
+        return command
+
+    @staticmethod
+    def _write_schema(schema: Path) -> None:
+        schema.write_text(json.dumps({
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "writes": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["path", "content"], "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}},
+                "deletions": {"type": "array", "items": {"type": "string"}},
+                "provenance": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["concept_path", "occurrence", "source_version"], "properties": {"concept_path": {"type": "string"}, "occurrence": {"type": "integer", "minimum": 0}, "source_version": {"type": "string"}}}},
+                "metadata": {"type": "object"},
+            },
+        }, sort_keys=True), encoding="utf-8")
 
 
 def _sandbox_environment() -> dict[str, str]:
@@ -577,8 +631,3 @@ def _citation_matches(link: tuple[str, str], source: SourceDocument) -> bool:
 def validate_adapter_result(adapter_result: AdapterResult | Mapping[str, Any]) -> AdapterResult:
     """Public strict parser useful for deterministic adapter fixtures."""
     return _strict_adapter_result(adapter_result)
-
-
-def synthesize_controlled(adapter: Any, batch_sources: list[SourceDocument], concept_catalog: Mapping[str, Any], workspace: Path, *, vault: Path | None = None, committed_sources: list[SourceDocument] = ()) -> SynthesisOutcome | SynthesisFailure:
-    """Convenience entry point for callers that do not need a long-lived runner."""
-    return ControlledSynthesis(adapter).run(batch_sources, concept_catalog, workspace, vault=vault, committed_sources=committed_sources)

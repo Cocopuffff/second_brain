@@ -1,9 +1,9 @@
 # Second Brain Ingestion Specification
 
-**Status:** Ready for implementation  
+**Status:** Living specification; SEC-5 complete, SEC-6 in progress
 **Target location:** `Second Brain/System/Second Brain Ingestion Spec.md`  
 **Vault:** `Second Brain`  
-**Version:** 1.0
+**Version:** 1.1
 
 ## Problem Statement
 
@@ -18,7 +18,7 @@ Article and transcript sources must remain stable, immutable evidence. Concept n
 Build a local, batch-oriented Python application that:
 
 1. Claims article URLs, saved HTML files, and YouTube playlist entries into SQLite.
-2. Acknowledges claimed mobile queue entries without losing jobs during crashes.
+2. Records mobile queue acknowledgement intent at claim time and finalizes it only after successful publication.
 3. Converts successful inputs into immutable, deterministic Markdown sources.
 4. Replaces meaningful article images with in-situ textual explanations rather than retaining image files.
 5. Runs concept synthesis once across the successful sources in each batch.
@@ -33,8 +33,8 @@ SQLite, credentials, OAuth tokens, staging files, and temporary image downloads 
 1. As an Android user, I want to capture an article by adding its URL to one Markdown file, so that capture stays frictionless.
 2. As an Android user, I want blank lines to remain valid in the capture file, so that its current format does not need to change.
 3. As a YouTube user, I want to capture videos through a dedicated playlist, so that mobile capture requires no custom application.
-4. As a vault owner, I want queue entries removed after the Mac accepts them, so that each queue means “not yet accepted by the Mac.”
-5. As a vault owner, I want accepted jobs recorded before queue entries are removed, so that a crash cannot lose work.
+4. As a vault owner, I want queue entries removed only after their source is published, so that capture queues do not hide unpublished work.
+5. As a vault owner, I want claimed jobs and acknowledgement intent recorded before publication, so that a crash cannot lose work or acknowledge it prematurely.
 6. As a vault owner, I want duplicate URLs and videos to be harmless, so that retrying capture does not duplicate sources.
 7. As a vault owner, I want canonical URL matching, so that tracking parameters and fragments do not create duplicate articles.
 8. As a vault owner, I want saved HTML preferred over network extraction, so that protected and JavaScript-heavy pages can still be processed.
@@ -58,7 +58,7 @@ SQLite, credentials, OAuth tokens, staging files, and temporary image downloads 
 26. As a vault owner, I want disagreements preserved, so that synthesis does not average conflicting evidence into a false consensus.
 27. As a vault owner, I want the agent free to restructure `Concepts/`, so that concept organization can improve over time.
 28. As a vault owner, I want agent writes confined to `Concepts/`, so that sources and unrelated notes cannot be altered.
-29. As an operator, I want pluggable synthesis executors, so that I can choose a direct API or an agentic harness.
+29. As an operator, I want pluggable synthesis executors, so that I can choose the DeepSeek tool-calling adapter or the Codex CLI adapter without changing publication semantics.
 30. As an operator, I want actionable status and retry commands, so that failures do not require editing SQLite manually.
 31. As an operator, I want one Git commit per non-empty completed batch, so that recovery and history remain understandable.
 32. As an operator, I want no commit for an empty batch, so that Git history remains meaningful.
@@ -111,7 +111,7 @@ A normal batch performs:
 acquire single-process lock
 → recover interrupted work
 → claim article URLs, saved HTML, and YouTube entries
-→ acknowledge claimed queues
+→ record tracked-queue and external-acknowledgement intent
 → ingest every processable source
 → synthesize once over successful batch sources
 → validate candidate changes
@@ -157,6 +157,8 @@ claimed → processing → source_ready → complete
                     ↘ failed
 ```
 
+`source_ready` means preparation succeeded and an exact source candidate is durably available outside the live vault. It is not completion. Only publication finalization may move a source-ready job to `complete`. A synthesis failure leaves the job and candidate source-ready for retry without refetching, retranscribing, reinterpreting images, reallocating a version, or changing rendered bytes.
+
 An interrupted `processing` job is recoverable because batches are explicit finite runs. On restart, the application identifies an unfinished batch and safely resumes or resets its incomplete jobs.
 
 Failures stay in SQLite. Retrying does not require re-adding a URL or video to a mobile queue.
@@ -169,13 +171,13 @@ At batch start:
 2. Parse plain HTTP or HTTPS URLs; allow blank lines.
 3. Canonicalize and deduplicate them.
 4. Insert or recognize their jobs in one committed SQLite transaction.
-5. Reread the queue file.
-6. Remove only URL lines whose canonical jobs are now durably present in SQLite.
-7. Replace the queue file atomically and preserve unrelated lines.
+5. Record an acknowledgement intent for the claimed canonical jobs.
+6. Before publication, reread the queue file and derive a candidate rewrite that removes only matching claimed URL lines while preserving unrelated lines.
+7. Hand the tracked queue rewrite and acknowledgement job IDs to publication with the validated source and concept candidates.
 
-The database commit always precedes queue removal.
+The database claim always precedes queue removal. Because the Markdown queue is tracked vault content, SEC-5's publication transaction writes and commits the candidate queue rewrite. Finalization then records queue acknowledgement in SQLite. A failed synthesis or failed publication leaves the live queue unchanged.
 
-If the process crashes after the database commit but before queue replacement, the next run recognizes the existing jobs and removes the duplicate queue entries safely.
+If the process crashes after the database claim, the next run recognizes the existing jobs. Publication recovery either completes or rolls back the journaled queue rewrite with the rest of the batch.
 
 Malformed or unsupported lines remain in the file and are reported rather than discarded.
 
@@ -304,10 +306,11 @@ For each playlist item:
 
 1. Extract and validate its video ID.
 2. Insert or recognize the job in committed SQLite state.
-3. Remove the playlist item after durable claim.
-4. Record acknowledgement success or failure.
+3. Record the playlist-item acknowledgement intent with the claimed job.
+4. After successful publication commit and recovery, remove the playlist item during idempotent finalization.
+5. Record acknowledgement success or retryable failure.
 
-If database claim succeeds but playlist removal fails, the job remains safe and playlist cleanup is retried. Seeing the same playlist item again is harmless.
+If database claim succeeds but synthesis or publication fails, the playlist item remains. If the publication commit succeeds but playlist removal fails, finalization retries the acknowledgement without reacquiring or republishing the source. Seeing the same playlist item again is harmless.
 
 YouTube credentials and OAuth refresh tokens remain outside the vault and Git.
 
@@ -342,13 +345,12 @@ Concept interpretation, thematic synthesis, recommendations, and cross-source co
 
 Synthesis runs once over all successfully prepared sources in the batch.
 
-The synthesizer receives:
+The public synthesis runner receives only:
 
+- The batch identifier.
 - The successful batch sources.
-- The existing concept catalog.
-- Existing concept aliases and links.
-- Narrow read capabilities.
-- An explicit write scope limited to `Concepts/`.
+
+The controlled-synthesis package owns concept-catalog loading, committed immutable-source discovery, narrow read construction, executor selection, candidate workspaces, normalization, validation, and safe failure classification. Catalog descriptors contain normalized paths, titles, aliases, and ordered outbound links. Full concept and source bodies are available only through bounded reads, except that Codex receives the complete verified concept baseline in its isolated candidate workspace.
 
 Before creating a concept, it searches existing filenames, titles, aliases, and closely matching concepts. It updates or restructures an existing concept when appropriate.
 
@@ -362,27 +364,27 @@ The executor may not mutate `Sources/`, `System/`, `ToIngest/`, Obsidian configu
 
 Source discovery, SQLite state, source rendering, validation, Git operations, and filesystem boundaries remain deterministic application responsibilities.
 
-The synthesis seam is a stable contract equivalent to:
+The public synthesis seam is:
 
 ```text
-synthesize(
-  batch_sources,
-  concept_catalog,
-  allowed_read_tools,
-  concepts_workspace
-) → validated change set and result metadata
+build_controlled_synthesis(config) → SynthesisRunner
+SynthesisRunner.run(batch_id, batch_sources) → SynthesisOutcome | SynthesisFailure
 ```
+
+`SynthesisOutcome` contains one normalized `ChangeSet` and typed metadata. `SynthesisFailure` contains a stable failure category, a safe message, and typed executor identity. `BatchRunner` never parses executor output, builds provenance aliases, or publishes an adapter result directly.
 
 At least two synthesis adapters are supported:
 
-1. A DeepSeek API adapter using the API’s current documented endpoint, models, JSON mode, and tool-calling behavior at implementation time. No model names from an earlier conversation are assumed to remain current. The API key comes from the environment.
-2. A Codex agentic-harness adapter using a reusable skill or workflow and an isolated workspace.
+1. A DeepSeek API adapter using an explicitly configured supported model and a strict bounded tool loop. The API key comes from the environment.
+2. A Codex CLI adapter whose invocation is constructed by the application and whose only writable project context is a fixed isolated candidate workspace.
 
 Both adapters implement the same contract. They are not separate pipelines.
 
-Direct API tools are narrow: list concepts, read a concept, search aliases, and read the current batch sources. Writes are represented as a validated change set rather than unrestricted filesystem access.
+Direct API tools are exactly: list concept descriptors, read one concept, search concept titles and aliases, and read one exact immutable source version from the new batch or committed source catalog. Writes are represented as an untrusted structured result rather than unrestricted filesystem access. The loop allows at most 16 rounds, 64 tool calls, 25 search results, 100 KB per body, and the configured total deadline. Initial requests contain identifiers, descriptors, tool schemas, and the output contract, never evidence bodies.
 
-The Codex adapter runs against an isolated candidate workspace. After execution, the deterministic application validates the resulting diff and rejects the entire synthesis if any change escapes `Concepts/`.
+The Codex adapter accepts `codex_executable` and optional `codex_model`; the retired `codex_command` setting is a migration error. Preflight checks the executable and required flags. The application invokes `codex exec` with `workspace-write`, approval policy `never`, ephemeral state, ignored user config and rules, strict config, no extra writable roots, a fixed candidate directory, and schema-validated output. After execution, the deterministic application validates the actual workspace diff and rejects the entire synthesis if any effect escapes `Concepts/`, modifies inputs, creates unexpected directories, or introduces a symlink or non-Markdown file. Optional stdout write/delete claims must match the observed diff exactly.
+
+Repository-owned adapters are trusted implementations of the internal seam. Model responses, tool calls, and Codex workspace effects are untrusted data. Third-party in-process production adapters are unsupported. The durable decision is recorded in `docs/adr/0001-controlled-synthesis-trust-model.md`.
 
 Path traversal, absolute paths, symlink escapes, case-folding tricks, and unexpected deletions outside the allowed scope must be rejected.
 
@@ -403,7 +405,7 @@ Publishing, committing, and finalizing are recoverable steps:
 
 Successful jobs may be committed even when other jobs in the same run fail. Failed jobs remain retryable and the batch report clearly states that it completed partially.
 
-If synthesis fails, no candidate source or concept changes are committed and raw HTML is retained.
+If synthesis fails, publication does not start. Prepared source candidates and their jobs remain `source_ready`, raw HTML is retained, tracked queue content stays unchanged, and live source or concept files, Git, completion state, finalization, and cleanup do not change.
 
 ### 16. Provenance
 
@@ -481,10 +483,11 @@ Non-secret configuration covers:
 - Retry and network limits.
 - Advanced URI link behavior.
 - DeepSeek base URL and model selection where applicable.
+- Codex executable and optional model selection where applicable.
 
 Secrets come from environment variables or OS-managed credential files outside the vault.
 
-At minimum, the DeepSeek key uses an environment variable. YouTube OAuth client material and refresh tokens remain outside the vault.
+At minimum, the DeepSeek key uses an environment variable and `deepseek_model` is explicit. YouTube OAuth client material and refresh tokens remain outside the vault. Codex configuration accepts `codex_executable` and optional `codex_model`; `codex_command` is rejected.
 
 Configuration errors fail during preflight before queue consumption.
 
@@ -506,15 +509,15 @@ SQLite and filesystem search are sufficient. The implementation must not introdu
 Tests exercise behavior through two public seams:
 
 1. The batch CLI using temporary vault, state, Git, HTTP, and YouTube fixtures.
-2. The synthesis/image-processor adapter contracts using deterministic fake adapters.
+2. The `second_brain.synthesis` public package using a fake DeepSeek transport, a fake Codex CLI executable, real temporary candidate workspaces, and deterministic image-processor adapters.
 
 Tests do not directly assert private helpers or internal SQL implementation details.
 
 ### Required tests
 
-1. A URL is committed to SQLite before it is removed from the capture file.
-2. A crash after SQLite commit but before queue replacement loses no job.
-3. A crash after queue replacement safely resumes from SQLite.
+1. A URL claim and acknowledgement intent are committed to SQLite before publication changes the capture file.
+2. A crash after claim but before publication loses no job and leaves the live capture file unchanged.
+3. A crash after the publication commit safely resumes queue acknowledgement from the journal and SQLite.
 4. Duplicate and canonically equivalent URLs produce one job.
 5. Blank lines remain accepted.
 6. Malformed lines are preserved and reported.
@@ -543,13 +546,13 @@ Tests do not directly assert private helpers or internal SQL implementation deta
 29. Manual source-language transcripts are preferred over automatic transcripts.
 30. Automatic source-language transcripts are accepted when manual transcripts are unavailable.
 31. A missing transcript fails without audio fallback.
-32. A video is removed from the playlist only after durable claim.
-33. Failed playlist removal is retried without duplicating the job.
+32. A video is removed from the playlist only during finalization after successful publication.
+33. Failed playlist removal is retried without duplicating, reacquiring, or republishing the job.
 34. Concept alias reconciliation can reuse an existing concept.
 35. Conflicting claims remain separately represented and cited.
 36. An executor write outside `Concepts/` rejects the complete change set.
 37. Traversal and symlink escape attempts are rejected.
-38. A failed synthesis produces no commit and deletes no raw HTML.
+38. A failed synthesis produces no commit, preserves the durable source-ready candidate, and deletes no raw HTML.
 39. A successful batch creates one narrowly staged commit.
 40. A partial batch commits successful work and retains failed jobs.
 41. A crash after Git commit but before SQLite finalization creates no duplicate commit.
@@ -557,6 +560,10 @@ Tests do not directly assert private helpers or internal SQL implementation deta
 43. An empty batch creates no commit.
 44. Pre-existing unrelated changes are never included in an automatic commit.
 45. Secrets and state cannot enter the staging set.
+46. DeepSeek's initial request contains no evidence bodies and all tool, round, search, body, and deadline limits fail safely.
+47. Codex execution uses the fixed safety flags and rejects mismatched claims, modified inputs, unexpected directories, symlinks, and non-Markdown effects.
+48. A failed synthesis preserves the exact durable source candidate and `source_ready` state while leaving publication, completion, queue acknowledgement, Git, and cleanup unchanged.
+49. Retrying a source-ready job reuses the exact prepared candidate without reacquisition or rerendering.
 
 Failpoints should be exposed at durable boundaries so crash-window tests remain deterministic.
 
@@ -600,4 +607,4 @@ Before each real batch:
 
 The implementation README must document initial YouTube OAuth setup, DeepSeek configuration, the Codex executor, the image-processing capability, Advanced URI installation, retries, recovery, source refresh, and safe handling of a dirty Git worktree.
 
-This specification closes the design frontier established in the prior grilling session. Implementers should not reopen settled product decisions unless the existing vault contains a direct technical conflict that cannot be resolved without changing observable behavior.
+This is the living product specification. Accepted architectural decisions in `docs/adr/` and domain terms in `CONTEXT.md` refine it. Implementers should not reopen settled product decisions unless the existing vault contains a direct technical conflict that cannot be resolved without changing observable behavior.

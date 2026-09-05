@@ -461,6 +461,33 @@ class StateStore:
     def list_jobs(self) -> list[Job]:
         return [self._job(row) for row in self.connection.execute("SELECT * FROM jobs ORDER BY updated_at DESC, id")]
 
+    def retryable_failed_jobs(self) -> list[Job]:
+        return [
+            self._job(row)
+            for row in self.connection.execute(
+                "SELECT * FROM jobs WHERE status='failed' AND retryable=1 ORDER BY created_at, id"
+            )
+        ]
+
+    def retry_failed_jobs(self, batch_id: str) -> list[Job]:
+        now = utc_now()
+        retried: list[Job] = []
+        with self.transaction() as db:
+            rows = db.execute(
+                "SELECT * FROM jobs WHERE status='failed' AND retryable=1 ORDER BY created_at, id"
+            ).fetchall()
+            for row in rows:
+                db.execute(
+                    """UPDATE jobs SET status='claimed', batch_id=?, failure_code=NULL,
+                       failure_message=NULL, updated_at=?
+                       WHERE id=? AND status='failed' AND retryable=1""",
+                    (batch_id, now, row["id"]),
+                )
+                retried_row = db.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
+                if retried_row is not None and retried_row["batch_id"] == batch_id and retried_row["status"] == "claimed":
+                    retried.append(self._job(retried_row))
+        return retried
+
     def list_batches(self) -> list[dict[str, str | None]]:
         return [dict(row) for row in self.connection.execute("SELECT * FROM batches ORDER BY created_at DESC")]
 
@@ -469,6 +496,8 @@ class StateStore:
             row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if not row:
                 raise KeyError(job_id)
+            if row["status"] != "failed":
+                raise ValueError(f"job {job_id} is not a failed job")
             if not row["retryable"]:
                 raise ValueError(f"job {job_id} is not retryable")
             db.execute("UPDATE jobs SET status='claimed', batch_id=?, failure_code=NULL, failure_message=NULL, updated_at=? WHERE id=?", (batch_id, utc_now(), job_id))

@@ -53,6 +53,13 @@ def _publication_statuses(config: Config, state: StateStore) -> list[dict]:
     return publications
 
 
+def _job_status(job) -> dict:
+    effective = job.__dict__.copy()
+    if job.status == "failed":
+        effective["retry_command"] = f"second-brain retry {job.id}" if job.retryable else None
+    return effective
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="second-brain", description="Batch ingestion for an Obsidian second brain vault")
     parser.add_argument("--config")
@@ -73,8 +80,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("preflight", help="validate configuration without consuming inputs")
     sub.add_parser("dry-run", help="discover inputs without consuming inputs")
     sub.add_parser("status", help="show durable batches, jobs, and cleanup state")
-    retry = sub.add_parser("retry", help="retry one durable failed job")
-    retry.add_argument("job_id")
+    retry = sub.add_parser("retry", help="retry one durable failed job or all eligible failed jobs")
+    retry.add_argument("job_id", nargs="?")
+    retry.add_argument("--all-eligible", "--all", dest="all_eligible", action="store_true", help="retry every currently eligible failed job")
     batch = sub.add_parser("batch", help="run one finite ingestion batch")
     batch.add_argument("--youtube-fixture")
     return parser
@@ -105,13 +113,40 @@ def main(argv: list[str] | None = None) -> int:
             state = StateStore(config.database)
             try:
                 pending_cleanup = [job.id for job in state.pending_cleanup()]
-                print(json.dumps({"batches": state.list_batches(), "jobs": [job.__dict__ for job in state.list_jobs()], "publications": _publication_statuses(config, state), "pending_cleanup": pending_cleanup, "outstanding_cleanup": len(pending_cleanup)}, ensure_ascii=False))
+                print(json.dumps({"batches": state.list_batches(), "jobs": [_job_status(job) for job in state.list_jobs()], "publications": _publication_statuses(config, state), "pending_cleanup": pending_cleanup, "outstanding_cleanup": len(pending_cleanup)}, ensure_ascii=False))
             finally:
                 state.close()
             return 0
         if args.command == "retry":
-            report = runner.run(retry_job_id=args.job_id)
-            print(json.dumps(report.__dict__, ensure_ascii=False))
+            if args.all_eligible and args.job_id:
+                raise ValueError("retry accepts a job ID or --all-eligible, not both")
+            if not args.all_eligible and not args.job_id:
+                raise ValueError("retry requires a job ID or --all-eligible")
+            report = runner.run(retry_job_id=args.job_id, retry_all=args.all_eligible)
+            selected_job_ids: list[str] = []
+            if args.all_eligible:
+                selected_job_ids = list(getattr(report, "selected_job_ids", ()))
+                print(
+                    json.dumps(
+                        {
+                            "mode": "all-eligible",
+                            "selected": len(selected_job_ids),
+                            "selected_job_ids": selected_job_ids,
+                            "batch_id": report.batch_id or None,
+                            "completed": report.completed,
+                            "failed": report.failed,
+                            "committed": report.committed,
+                            "commit_id": report.commit_id,
+                            "failures": list(report.failures),
+                            "recovery_block_reason": report.recovery_block_reason,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            else:
+                print(json.dumps(report.__dict__, ensure_ascii=False))
+            if args.all_eligible:
+                return 2 if report.recovery_block_reason else (0 if report.committed or not selected_job_ids else 1)
             return 2 if report.recovery_block_reason else (0 if report.committed else 1)
         if args.command == "batch":
             if args.youtube_fixture:

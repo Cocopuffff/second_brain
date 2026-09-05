@@ -12,7 +12,7 @@ from .extraction import ImageProcessor
 from .git_ops import GitError, GitRepository
 from .html_discovery import discover_html
 from .intake import SourceIntakeFailure, build_source_intake, queue_path_for
-from .models import BatchReport, COMMITTED_PUBLICATION_PHASES, ChangeSet, Job, PublicationPhase, SourceCandidate, PreparationFailure
+from .models import BatchReport, COMMITTED_PUBLICATION_PHASES, ChangeSet, Job, PublicationPhase, RetryReport, SourceCandidate, PreparationFailure
 from .preparation import PreparationFaults, SourcePreparation, build_source_preparation
 from .publication import BatchPublication, PublicationCrash, PublicationError, PublicationFaults, PublicationResult
 from .queue import remove_claimed_urls_text
@@ -118,7 +118,9 @@ class BatchRunner:
         html_files, html_errors = discover_html(self.config.to_ingest)
         return {"queue_urls": len(inputs), "html_files": len(html_files), "errors": queue_errors + html_errors}
 
-    def run(self, retry_job_id: str | None = None) -> BatchReport:
+    def run(self, retry_job_id: str | None = None, retry_all: bool = False) -> BatchReport:
+        if retry_job_id and retry_all:
+            raise BatchError("choose one retry job or all eligible jobs")
         errors = self.config.validate()
         if errors:
             raise BatchError("preflight failed: " + "; ".join(errors))
@@ -127,13 +129,14 @@ class BatchRunner:
         try:
             with single_process_lock(self.config.lockfile):
                 try:
-                    return self._run_locked(state, retry_job_id)
+                    report = self._run_locked(state, retry_job_id, retry_all)
+                    return self._retry_report(report, ()) if retry_all and not isinstance(report, RetryReport) else report
                 except GitError as exc:
                     raise BatchError(str(exc)) from exc
         finally:
             state.close()
 
-    def _run_locked(self, state: StateStore, retry_job_id: str | None = None) -> BatchReport:
+    def _run_locked(self, state: StateStore, retry_job_id: str | None = None, retry_all: bool = False) -> BatchReport:
         git = GitRepository(self.config.vault)
         preparation = build_source_preparation(self.config, state, self.image_processor, faults=self._preparation_faults)
         publication = BatchPublication(
@@ -163,18 +166,30 @@ class BatchRunner:
             fetcher=self.fetcher,
             youtube_client=self.youtube_client,
         )
-        # Queue and raw HTML are accepted inputs; every other existing staged,
-        # modified, or untracked path is an operator-owned stop condition.
-        allowed_paths = intake.allowed_input_paths()
+        retry_job_ids: tuple[str, ...] = ()
+        if retry_all:
+            eligible = state.retryable_failed_jobs()
+            if not eligible:
+                return RetryReport(batch_id="", claimed=0, completed=0, failed=0, committed=False, commit_id=None, selected_job_ids=())
+            allowed_paths = intake.allowed_retry_paths(eligible)
+        else:
+            # Queue and raw HTML are accepted inputs; every other existing staged,
+            # modified, or untracked path is an operator-owned stop condition.
+            allowed_paths = intake.allowed_input_paths()
         git.ensure_clean(allowed_paths=allowed_paths)
         batch_id = state.create_batch()
-        if retry_job_id:
-            try:
-                state.retry(retry_job_id, batch_id)
-            except (KeyError, ValueError) as exc:
-                state.fail_batch(batch_id)
-                raise BatchError(str(exc)) from exc
-        intake_batch = intake.collect(batch_id)
+        if retry_all:
+            retry_jobs = state.retry_failed_jobs(batch_id)
+            retry_job_ids = tuple(job.id for job in retry_jobs)
+            intake_batch = intake.collect_retries(batch_id, retry_jobs)
+        else:
+            if retry_job_id:
+                try:
+                    state.retry(retry_job_id, batch_id)
+                except (KeyError, ValueError) as exc:
+                    state.fail_batch(batch_id)
+                    raise BatchError(str(exc)) from exc
+            intake_batch = intake.collect(batch_id)
         claimed_count = intake_batch.claimed_count
         failures = [
             f"{failure.source.original_locator}: {failure.safe_message}"
@@ -213,9 +228,11 @@ class BatchRunner:
 
         if not sources:
             state.fail_batch(batch_id)
-            return BatchReport(batch_id=batch_id, claimed=claimed_count, completed=0, failed=len(failures), committed=False, commit_id=None, failures=tuple(failures))
+            report = BatchReport(batch_id=batch_id, claimed=claimed_count, completed=0, failed=len(failures), committed=False, commit_id=None, failures=tuple(failures))
+            return self._retry_report(report, retry_job_ids) if retry_all else report
 
-        return self._publish_prepared(_PreparedBatch(state, git, publication, batch_id, sources, source_jobs, queue_path, queue_job_ids, raw_fingerprints, claimed_count, failures, set(intake_batch.allowed_paths)))
+        report = self._publish_prepared(_PreparedBatch(state, git, publication, batch_id, sources, source_jobs, queue_path, queue_job_ids, raw_fingerprints, claimed_count, failures, set(intake_batch.allowed_paths)))
+        return self._retry_report(report, retry_job_ids) if retry_all else report
 
     def _synthesize(self, batch_id: str, sources: list[SourceCandidate]) -> tuple[ChangeSet, dict, SynthesisFailure | None]:
         """Cross the one typed synthesis seam; no legacy fallback exists."""
@@ -343,6 +360,25 @@ class BatchRunner:
         failed = sum(job.status == "failed" for job in jobs) if failed is None else failed
         failures = tuple(job.failure_message for job in jobs if job.failure_message) if not failures else failures
         return BatchReport(batch_id=result.batch_id, claimed=claimed, completed=completed, failed=failed, committed=result.phase in COMMITTED_PUBLICATION_PHASES, commit_id=result.commit_id, failures=failures, publication_phase=result.phase, recovery_action=result.action, recovery_block_reason=(result.failure_code or result.failure_message) if result.phase == PublicationPhase.RECOVERY_BLOCKED else None, publication_failure_code=result.failure_code, publication_failure_message=result.failure_message, outstanding_cleanup=len(state.pending_cleanup()))
+
+    @staticmethod
+    def _retry_report(report: BatchReport, selected_job_ids: tuple[str, ...]) -> RetryReport:
+        return RetryReport(
+            batch_id=report.batch_id,
+            claimed=report.claimed,
+            completed=report.completed,
+            failed=report.failed,
+            committed=report.committed,
+            commit_id=report.commit_id,
+            failures=report.failures,
+            publication_phase=report.publication_phase,
+            recovery_action=report.recovery_action,
+            recovery_block_reason=report.recovery_block_reason,
+            publication_failure_code=report.publication_failure_code,
+            publication_failure_message=report.publication_failure_message,
+            outstanding_cleanup=report.outstanding_cleanup,
+            selected_job_ids=selected_job_ids,
+        )
 
     def _queue_path(self) -> Path:
         return queue_path_for(self.config)

@@ -329,3 +329,8 @@ class BatchReport:
     publication_failure_code: str | None = None
     publication_failure_message: str | None = None
     outstanding_cleanup: int = 0
+
+
+@dataclass(frozen=True)
+class RetryReport(BatchReport):
+    selected_job_ids: tuple[str, ...] = ()

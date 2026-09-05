@@ -105,6 +105,8 @@ The public CLI seam provides these capabilities:
 - Validate the vault without consuming inputs.
 - Perform a dry run against fixtures or discovered inputs.
 
+The concrete retry commands are `second-brain retry <job_id>` for one failed job and `second-brain retry --all-eligible` for the all-eligible mode. The latter selects only failed jobs marked retryable, ordered by durable creation time and ID; it does not reopen active, completed, or non-retryable jobs. It reuses the persisted input locator or artifact, and an empty selection succeeds without creating a batch or Git commit. `status` includes the applicable single-job retry command for each failed job.
+
 A normal batch performs:
 
 ```text

@@ -6,7 +6,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable, Literal, Protocol, TypeAlias
 
-from .canonical import source_key
+from .canonical import source_key, youtube_video_id
 from .config import Config
 from .html_discovery import discover_html, html_hash
 from .models import AcquiredArticle, AcquiredYouTube, Job, PublicationIntent, SourceKind
@@ -292,6 +292,74 @@ class SourceIntake:
             frozenset(self.allowed_input_paths()),
         )
 
+    def collect_retries(self, batch_id: str, jobs: list[Job]) -> IntakeBatch:
+        successes: list[IntakeSuccess] = []
+        failures: list[IntakeFailure] = []
+        for job in jobs:
+            if job.status != "claimed" or job.batch_id != batch_id:
+                continue
+            try:
+                descriptor, adapter = self._retry_work(job)
+                successes.append(IntakeSuccess(job, adapter.acquire(descriptor, job)))
+            except Exception as exc:
+                self.state.fail(job.id, IntakeFailureCategory.ACQUISITION_FAILED.value, str(exc))
+                failures.append(
+                    SourceIntakeFailure(
+                        category=IntakeFailureCategory.ACQUISITION_FAILED,
+                        safe_message=str(exc),
+                        source=IntakeSource(job.kind, job.source_key, job.original_locator, job.input_artifact),
+                        job_id=job.id,
+                    )
+                )
+        return IntakeBatch(
+            tuple(successes),
+            tuple(failures),
+            len(jobs),
+            self.queue_path,
+            frozenset(self.allowed_retry_paths(jobs)),
+        )
+
+    def _retry_work(self, job: Job) -> tuple[WorkDescriptor, IntakeAdapter]:
+        if job.kind == "article":
+            html_path = self._retry_html_path(job)
+            intent = PublicationIntent(
+                queue_path=job.queue_path,
+                queue_locator=job.queue_locator,
+                raw_path=job.input_artifact,
+                raw_hash=html_hash(html_path) if html_path else None,
+            )
+            descriptor: WorkDescriptor = ArticleWorkDescriptor(job.source_key, job.original_locator, intent, html_path=html_path)
+            adapter = next((item for item in self.adapters if isinstance(item, ArticleIntakeAdapter)), None)
+        elif job.kind == "youtube":
+            video_id = youtube_video_id(job.original_locator)
+            if not video_id:
+                raise ValueError(f"job {job.id} has an invalid YouTube locator")
+            intent = PublicationIntent(
+                queue_path=job.queue_path,
+                queue_locator=job.queue_locator,
+                youtube_playlist_item_id=job.youtube_playlist_item_id,
+            )
+            descriptor = YouTubeWorkDescriptor(job.source_key, job.original_locator, intent, video_id)
+            adapter = next((item for item in self.adapters if isinstance(item, YouTubeIntakeAdapter)), None)
+        else:
+            raise ValueError(f"retry does not support job kind {job.kind}")
+        if adapter is None:
+            raise ValueError(f"retry requires a configured {job.kind} intake client")
+        return descriptor, adapter
+
+    def _retry_html_path(self, job: Job) -> Path | None:
+        if not job.input_artifact:
+            return None
+        path = Path(job.input_artifact)
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(self.config.to_ingest.resolve())
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise ValueError("saved HTML artifact is unavailable or outside ToIngest") from exc
+        if not path.is_file():
+            raise ValueError("saved HTML artifact is unavailable or outside ToIngest")
+        return path
+
     def allowed_input_paths(self) -> set[str]:
         allowed = {str(self.queue_path.relative_to(self.config.vault))}
         pairing = self.config.to_ingest / "HTML Pairings.yaml"
@@ -304,6 +372,24 @@ class SourceIntake:
                 if path.is_file() and path.suffix.lower() in {".html", ".htm"}
             )
         return allowed
+
+    def allowed_retry_paths(self, jobs: list[Job]) -> set[str]:
+        allowed = {str(self.queue_path.relative_to(self.config.vault))}
+        for job in jobs:
+            for value in (job.queue_path, job.input_artifact):
+                if not value:
+                    continue
+                allowed.add(self._retry_relative_path(value))
+        return allowed
+
+    def _retry_relative_path(self, value: str) -> str:
+        path = Path(value)
+        if not path.is_absolute():
+            path = self.config.vault / path
+        try:
+            return str(path.resolve(strict=False).relative_to(self.config.vault.resolve()))
+        except (OSError, ValueError) as exc:
+            raise ValueError("retry input path is outside the vault") from exc
 
 
 def build_source_intake(

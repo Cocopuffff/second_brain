@@ -332,5 +332,6 @@ class BatchReport:
 
 
 @dataclass(frozen=True)
-class RetryReport(BatchReport):
+class RetryReport:
+    report: BatchReport
     selected_job_ids: tuple[str, ...] = ()

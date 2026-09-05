@@ -4,13 +4,17 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from second_brain.batch import BatchRunner
 from second_brain.cli import build_parser, main
 from second_brain.config import Config
 from second_brain.intake import ArticleIntakeAdapter, SourceIntake
 from second_brain.models import AcquiredArticle, Job, PublicationIntent
+from second_brain.publication import PublicationCrash
 from second_brain.state import StateStore
 from second_brain.synthesis import ExecutorIdentity, FailureCategory, SynthesisFailure
+from second_brain.youtube import FixtureYouTubeClient
 
 
 def _git_repo(path: Path) -> None:
@@ -33,6 +37,110 @@ def test_retry_parser_supports_explicit_all_eligible_mode():
     assert args.command == "retry"
     assert args.all_eligible is True
     assert args.job_id is None
+
+
+def test_cli_all_retry_recovers_pending_youtube_acknowledgement(tmp_path: Path, capsys):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "To Ingest.md").write_text("", encoding="utf-8")
+    fixture = tmp_path / "youtube.json"
+    fixture.write_text(
+        '{"To Ingest": [{"video_id": "abcDEF12345", "title": "Video", "playlist_item_id": "playlist-item", "manual_transcript": [{"start": 12, "end": 20, "text": "Evidence"}]}]}',
+        encoding="utf-8",
+    )
+    _git_repo(vault)
+    config = Config.load(vault, tmp_path / "state")
+
+    class CrashAfterAcknowledgement:
+        def hit(self, event: str, **_details) -> None:
+            if event == "youtube_acknowledged":
+                raise PublicationCrash(event)
+
+    with pytest.raises(PublicationCrash):
+        BatchRunner(
+            config,
+            youtube_client=FixtureYouTubeClient(fixture),
+            _publication_faults=CrashAfterAcknowledgement(),  # pyright: ignore[reportArgumentType]
+        ).run()
+
+    assert main(
+        [
+            "--vault",
+            str(vault),
+            "--state-dir",
+            str(config.state_dir),
+            "retry",
+            "--youtube-fixture",
+            str(fixture),
+            "--all-eligible",
+        ]
+    ) == 0
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["selected"] == 0
+    assert report["committed"] is True
+    state = StateStore(config.database)
+    try:
+        job = state.find("youtube:https://www.youtube.com/watch?v=abcDEF12345")
+        assert job is not None
+        assert job.queue_acknowledged
+        assert job.batch_id is not None
+        assert state.pending_publication_acknowledgements(job.batch_id) == []
+    finally:
+        state.close()
+
+
+def test_cli_all_retry_reacquires_youtube_from_durable_video_id(tmp_path: Path, capsys):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "To Ingest.md").write_text("", encoding="utf-8")
+    fixture = tmp_path / "youtube.json"
+    fixture.write_text(
+        '{"To Ingest": [{"video_id": "abcDEF12345", "title": "Video", "playlist_item_id": "playlist-item", "manual_transcript": [{"start": 12, "end": 20, "text": "Evidence"}]}]}',
+        encoding="utf-8",
+    )
+    _git_repo(vault)
+    config = Config.load(vault, tmp_path / "state")
+    state = StateStore(config.database)
+    try:
+        original_batch = state.create_batch()
+        job = state.claim(
+            "youtube",
+            "youtube:https://www.youtube.com/watch?v=abcDEF12345",
+            "https://www.youtube.com/watch?v=abcDEF12345",
+            input_artifact=None,
+            batch_id=original_batch,
+            publication_intent=PublicationIntent(youtube_playlist_item_id="playlist-item"),
+        )
+        state.fail(job.id, "transcript_failed", "temporary", retryable=True)
+    finally:
+        state.close()
+
+    assert main(
+        [
+            "--vault",
+            str(vault),
+            "--state-dir",
+            str(config.state_dir),
+            "retry",
+            "--youtube-fixture",
+            str(fixture),
+            "--all-eligible",
+        ]
+    ) == 0
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["selected_job_ids"] == [job.id]
+    assert report["completed"] == 1
+    assert report["failed"] == 0
+    assert report["committed"] is True
+    state = StateStore(config.database)
+    try:
+        retried = _job(state, job.id)
+        assert retried.status == "complete"
+        assert retried.queue_acknowledged
+    finally:
+        state.close()
 
 
 def test_state_lists_only_retryable_failed_jobs_in_stable_order(tmp_path: Path):
@@ -391,3 +499,47 @@ def test_cli_all_retry_resumes_source_ready_candidate_exactly(tmp_path: Path, ca
     assert calls == ["https://example.com/article"]
     published = next((vault / "Sources").rglob("*.md"))
     assert published.read_bytes() == prepared
+
+
+def test_cli_all_retry_fails_when_source_ready_recovery_fails(tmp_path: Path, capsys):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "To Ingest.md").write_text("https://example.com/article\n", encoding="utf-8")
+    _git_repo(vault)
+    config = Config.load(vault, tmp_path / "state")
+
+    class FailingSynthesis:
+        def run(self, _batch_id, _sources):
+            return SynthesisFailure(FailureCategory.ADAPTER_EXECUTION_FAILURE, "temporary synthesis failure", ExecutorIdentity("fixture"))
+
+    first = BatchRunner(
+        config,
+        synthesis_runner=FailingSynthesis(),  # pyright: ignore[reportArgumentType]
+        fetcher=lambda _url: "<article><p>Exact durable evidence.</p></article>",
+    ).run()
+    assert first.committed is False
+    state = StateStore(config.database)
+    try:
+        ready = state.source_ready_jobs()
+        assert len(ready) == 1
+        candidate = state.source_candidate(ready[0].id)
+        assert candidate is not None
+        Path(candidate.artifact_path, "source.md").unlink()
+    finally:
+        state.close()
+
+    assert main(
+        [
+            "--vault",
+            str(vault),
+            "--state-dir",
+            str(config.state_dir),
+            "retry",
+            "--all-eligible",
+        ]
+    ) == 1
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["selected"] == 0
+    assert report["failed"] == 1
+    assert report["committed"] is False

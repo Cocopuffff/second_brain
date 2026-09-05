@@ -67,10 +67,17 @@ class FixtureYouTubeClient:
         ]
 
     def acquire_video(self, video_id: str) -> VideoInput:
-        try:
-            item = self._discovered[video_id]
-        except KeyError as exc:
-            raise TranscriptError(f"video was not discovered in the configured playlist: {video_id}") from exc
+        item = self._discovered.get(video_id)
+        if item is None:
+            matches = [
+                candidate
+                for candidate in self._fixture_items()
+                if str(candidate.get("video_id")) == video_id
+            ]
+            if len(matches) != 1:
+                raise TranscriptError(f"fixture does not contain one video with ID: {video_id}")
+            item = matches[0]
+            self._discovered[video_id] = item
         return _video(item)
 
     def acknowledge(self, playlist_item_id: str) -> YouTubeAcknowledgement:
@@ -80,6 +87,20 @@ class FixtureYouTubeClient:
         self._removed.add(playlist_item_id)
         self.acknowledged.append(playlist_item_id)
         return YouTubeAcknowledgement.REMOVED
+
+    def _fixture_items(self) -> list[dict]:
+        data = json.loads(self.fixture.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict):
+            return [
+                item
+                for collection in data.values()
+                if isinstance(collection, list)
+                for item in collection
+                if isinstance(item, dict)
+            ]
+        return []
 
 
 def _segments(values: list[dict]) -> tuple[TranscriptSegment, ...]:

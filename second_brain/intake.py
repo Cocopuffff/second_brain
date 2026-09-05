@@ -84,6 +84,10 @@ class ArticleWorkDescriptor:
     html_path: Path | None = None
     kind: Literal["article"] = field(default="article", init=False)
 
+    @property
+    def input_artifact(self) -> str | None:
+        return str(self.html_path) if self.html_path else None
+
 
 @dataclass(frozen=True)
 class YouTubeWorkDescriptor:
@@ -93,17 +97,28 @@ class YouTubeWorkDescriptor:
     video_id: str
     kind: Literal["youtube"] = field(default="youtube", init=False)
 
+    @property
+    def input_artifact(self) -> None:
+        return None
+
 
 WorkDescriptor = ArticleWorkDescriptor | YouTubeWorkDescriptor
 
 
 class IntakeAdapter(Protocol):
+    @property
+    def kind(self) -> SourceKind: ...
+
     def discover(self) -> tuple[list[WorkDescriptor], list[DiscoveryFailure]]: ...
 
     def acquire(self, descriptor: WorkDescriptor, job: Job) -> AcquiredPayload: ...
 
+    def retry_descriptor(self, job: Job) -> WorkDescriptor: ...
+
 
 class ArticleIntakeAdapter:
+    kind: Literal["article"] = "article"
+
     def __init__(self, config: Config, fetcher: Callable[[str], str]):
         self.config = config
         self.fetcher = fetcher
@@ -172,8 +187,35 @@ class ArticleIntakeAdapter:
             input_method = "http"
         return AcquiredArticle(html, input_method, descriptor.publication_intent)
 
+    def retry_descriptor(self, job: Job) -> ArticleWorkDescriptor:
+        if job.kind != self.kind:
+            raise TypeError("article intake received a non-article job")
+        html_path = self._retry_html_path(job)
+        intent = PublicationIntent(
+            queue_path=job.queue_path,
+            queue_locator=job.queue_locator,
+            raw_path=job.input_artifact,
+            raw_hash=html_hash(html_path) if html_path else None,
+        )
+        return ArticleWorkDescriptor(job.source_key, job.original_locator, intent, html_path=html_path)
+
+    def _retry_html_path(self, job: Job) -> Path | None:
+        if not job.input_artifact:
+            return None
+        path = Path(job.input_artifact)
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(self.config.to_ingest.resolve())
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise ValueError("saved HTML artifact is unavailable or outside ToIngest") from exc
+        if not path.is_file():
+            raise ValueError("saved HTML artifact is unavailable or outside ToIngest")
+        return path
+
 
 class YouTubeIntakeAdapter:
+    kind: Literal["youtube"] = "youtube"
+
     def __init__(self, playlist: YouTubePlaylistReference, client: YouTubeClient):
         self.playlist = playlist
         self.client = client
@@ -210,6 +252,19 @@ class YouTubeIntakeAdapter:
             raise TypeError("YouTube intake received a non-YouTube descriptor")
         video = self.client.acquire_video(descriptor.video_id)
         return AcquiredYouTube(video, descriptor.publication_intent)
+
+    def retry_descriptor(self, job: Job) -> YouTubeWorkDescriptor:
+        if job.kind != self.kind:
+            raise TypeError("YouTube intake received a non-YouTube job")
+        video_id = youtube_video_id(job.original_locator)
+        if not video_id:
+            raise ValueError(f"job {job.id} has an invalid YouTube locator")
+        intent = PublicationIntent(
+            queue_path=job.queue_path,
+            queue_locator=job.queue_locator,
+            youtube_playlist_item_id=job.youtube_playlist_item_id,
+        )
+        return YouTubeWorkDescriptor(job.source_key, job.original_locator, intent, video_id)
 
 
 class SourceIntake:
@@ -258,32 +313,18 @@ class SourceIntake:
                     descriptor.kind,
                     descriptor.source_key,
                     descriptor.original_locator,
-                    input_artifact=str(descriptor.html_path) if isinstance(descriptor, ArticleWorkDescriptor) and descriptor.html_path else None,
+                    input_artifact=descriptor.input_artifact,
                     batch_id=batch_id,
                     publication_intent=descriptor.publication_intent,
                 )
                 if not owned or job.status != "claimed" or job.batch_id != batch_id:
                     continue
                 claimed_count += 1
-                try:
-                    successes.append(IntakeSuccess(job, adapter.acquire(descriptor, job)))
-                except Exception as exc:
-                    self.state.fail(job.id, IntakeFailureCategory.ACQUISITION_FAILED.value, str(exc))
-                    failures.append(
-                        SourceIntakeFailure(
-                            category=IntakeFailureCategory.ACQUISITION_FAILED,
-                            safe_message=str(exc),
-                            source=IntakeSource(
-                                descriptor.kind,
-                                descriptor.source_key,
-                                descriptor.original_locator,
-                                str(descriptor.html_path)
-                                if isinstance(descriptor, ArticleWorkDescriptor) and descriptor.html_path
-                                else None,
-                            ),
-                            job_id=job.id,
-                        )
-                    )
+                result = self._acquire(adapter, descriptor, job)
+                if isinstance(result, IntakeSuccess):
+                    successes.append(result)
+                else:
+                    failures.append(result)
         return IntakeBatch(
             tuple(successes),
             tuple(failures),
@@ -300,17 +341,14 @@ class SourceIntake:
                 continue
             try:
                 descriptor, adapter = self._retry_work(job)
-                successes.append(IntakeSuccess(job, adapter.acquire(descriptor, job)))
             except Exception as exc:
-                self.state.fail(job.id, IntakeFailureCategory.ACQUISITION_FAILED.value, str(exc))
-                failures.append(
-                    SourceIntakeFailure(
-                        category=IntakeFailureCategory.ACQUISITION_FAILED,
-                        safe_message=str(exc),
-                        source=IntakeSource(job.kind, job.source_key, job.original_locator, job.input_artifact),
-                        job_id=job.id,
-                    )
-                )
+                failures.append(self._acquisition_failure(job, exc))
+                continue
+            result = self._acquire(adapter, descriptor, job)
+            if isinstance(result, IntakeSuccess):
+                successes.append(result)
+            else:
+                failures.append(result)
         return IntakeBatch(
             tuple(successes),
             tuple(failures),
@@ -320,45 +358,34 @@ class SourceIntake:
         )
 
     def _retry_work(self, job: Job) -> tuple[WorkDescriptor, IntakeAdapter]:
-        if job.kind == "article":
-            html_path = self._retry_html_path(job)
-            intent = PublicationIntent(
-                queue_path=job.queue_path,
-                queue_locator=job.queue_locator,
-                raw_path=job.input_artifact,
-                raw_hash=html_hash(html_path) if html_path else None,
-            )
-            descriptor: WorkDescriptor = ArticleWorkDescriptor(job.source_key, job.original_locator, intent, html_path=html_path)
-            adapter = next((item for item in self.adapters if isinstance(item, ArticleIntakeAdapter)), None)
-        elif job.kind == "youtube":
-            video_id = youtube_video_id(job.original_locator)
-            if not video_id:
-                raise ValueError(f"job {job.id} has an invalid YouTube locator")
-            intent = PublicationIntent(
-                queue_path=job.queue_path,
-                queue_locator=job.queue_locator,
-                youtube_playlist_item_id=job.youtube_playlist_item_id,
-            )
-            descriptor = YouTubeWorkDescriptor(job.source_key, job.original_locator, intent, video_id)
-            adapter = next((item for item in self.adapters if isinstance(item, YouTubeIntakeAdapter)), None)
-        else:
-            raise ValueError(f"retry does not support job kind {job.kind}")
+        adapter = next((item for item in self.adapters if item.kind == job.kind), None)
         if adapter is None:
             raise ValueError(f"retry requires a configured {job.kind} intake client")
-        return descriptor, adapter
+        return adapter.retry_descriptor(job), adapter
 
-    def _retry_html_path(self, job: Job) -> Path | None:
-        if not job.input_artifact:
-            return None
-        path = Path(job.input_artifact)
+    def _acquire(self, adapter: IntakeAdapter, descriptor: WorkDescriptor, job: Job) -> IntakeSuccess | SourceIntakeFailure:
         try:
-            resolved = path.resolve(strict=True)
-            resolved.relative_to(self.config.to_ingest.resolve())
-        except (FileNotFoundError, OSError, ValueError) as exc:
-            raise ValueError("saved HTML artifact is unavailable or outside ToIngest") from exc
-        if not path.is_file():
-            raise ValueError("saved HTML artifact is unavailable or outside ToIngest")
-        return path
+            return IntakeSuccess(job, adapter.acquire(descriptor, job))
+        except Exception as exc:
+            return self._acquisition_failure(
+                job,
+                exc,
+                source=IntakeSource(
+                    descriptor.kind,
+                    descriptor.source_key,
+                    descriptor.original_locator,
+                    descriptor.input_artifact,
+                ),
+            )
+
+    def _acquisition_failure(self, job: Job, exc: Exception, *, source: IntakeSource | None = None) -> SourceIntakeFailure:
+        self.state.fail(job.id, IntakeFailureCategory.ACQUISITION_FAILED.value, str(exc))
+        return SourceIntakeFailure(
+            category=IntakeFailureCategory.ACQUISITION_FAILED,
+            safe_message=str(exc),
+            source=source or IntakeSource(job.kind, job.source_key, job.original_locator, job.input_artifact),
+            job_id=job.id,
+        )
 
     def allowed_input_paths(self) -> set[str]:
         allowed = {str(self.queue_path.relative_to(self.config.vault))}

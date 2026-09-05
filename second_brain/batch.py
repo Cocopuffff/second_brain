@@ -118,7 +118,7 @@ class BatchRunner:
         html_files, html_errors = discover_html(self.config.to_ingest)
         return {"queue_urls": len(inputs), "html_files": len(html_files), "errors": queue_errors + html_errors}
 
-    def run(self, retry_job_id: str | None = None, retry_all: bool = False) -> BatchReport:
+    def run(self, retry_job_id: str | None = None, retry_all: bool = False) -> BatchReport | RetryReport:
         if retry_job_id and retry_all:
             raise BatchError("choose one retry job or all eligible jobs")
         errors = self.config.validate()
@@ -130,13 +130,13 @@ class BatchRunner:
             with single_process_lock(self.config.lockfile):
                 try:
                     report = self._run_locked(state, retry_job_id, retry_all)
-                    return self._retry_report(report, ()) if retry_all and not isinstance(report, RetryReport) else report
+                    return RetryReport(report) if retry_all and not isinstance(report, RetryReport) else report
                 except GitError as exc:
                     raise BatchError(str(exc)) from exc
         finally:
             state.close()
 
-    def _run_locked(self, state: StateStore, retry_job_id: str | None = None, retry_all: bool = False) -> BatchReport:
+    def _run_locked(self, state: StateStore, retry_job_id: str | None = None, retry_all: bool = False) -> BatchReport | RetryReport:
         git = GitRepository(self.config.vault)
         preparation = build_source_preparation(self.config, state, self.image_processor, faults=self._preparation_faults)
         publication = BatchPublication(
@@ -170,7 +170,7 @@ class BatchRunner:
         if retry_all:
             eligible = state.retryable_failed_jobs()
             if not eligible:
-                return RetryReport(batch_id="", claimed=0, completed=0, failed=0, committed=False, commit_id=None, selected_job_ids=())
+                return RetryReport(BatchReport(batch_id="", claimed=0, completed=0, failed=0, committed=False, commit_id=None))
             allowed_paths = intake.allowed_retry_paths(eligible)
         else:
             # Queue and raw HTML are accepted inputs; every other existing staged,
@@ -363,22 +363,7 @@ class BatchRunner:
 
     @staticmethod
     def _retry_report(report: BatchReport, selected_job_ids: tuple[str, ...]) -> RetryReport:
-        return RetryReport(
-            batch_id=report.batch_id,
-            claimed=report.claimed,
-            completed=report.completed,
-            failed=report.failed,
-            committed=report.committed,
-            commit_id=report.commit_id,
-            failures=report.failures,
-            publication_phase=report.publication_phase,
-            recovery_action=report.recovery_action,
-            recovery_block_reason=report.recovery_block_reason,
-            publication_failure_code=report.publication_failure_code,
-            publication_failure_message=report.publication_failure_message,
-            outstanding_cleanup=report.outstanding_cleanup,
-            selected_job_ids=selected_job_ids,
-        )
+        return RetryReport(report, selected_job_ids)
 
     def _queue_path(self) -> Path:
         return queue_path_for(self.config)

@@ -13,6 +13,7 @@ python -m second_brain --vault "/path/to/Second Brain" dry-run
 python -m second_brain --vault "/path/to/Second Brain" batch
 python -m second_brain --vault "/path/to/Second Brain" retry <job_id>
 python -m second_brain --vault "/path/to/Second Brain" retry --all-eligible
+python -m second_brain --vault "/path/to/Second Brain" retry --youtube-fixture "/path/to/youtube.json" --all-eligible
 ```
 
 The default SQLite database and lock live under `~/.local/state/second-brain`, outside the vault. Set `SECOND_BRAIN_STATE_DIR` or pass `--state-dir` to choose another platform-local directory. A JSON config can select the executor, YouTube settings, image processor, and network limits.
@@ -58,7 +59,7 @@ Install and enable the Obsidian Advanced URI community plugin yourself. Article 
 
 The SQLite lifecycle records claims, attempts, failures, acknowledgements, source hashes, cleanup, and Git commit IDs. Each non-empty publication also has a durable journal and an external rollback snapshot. Re-running a batch reconciles the oldest interrupted publication before accepting new input; that recovery invocation reports its action and stops. A blocked recovery is never guessed through: inspect `status`, repair only the reported condition, and rerun.
 
-Use `status` to find each failed job's `retry_command`. `retry <job_id>` preserves the single-job workflow. `retry --all-eligible` selects only retryable failed jobs in stable creation order, reuses their durable queue or saved-input records without requiring new capture input, and prints a concise selected/completed/failed report. Completed, active, and non-retryable jobs are left unchanged. If no eligible jobs exist, the command succeeds without creating a batch or Git commit. A pending source-ready recovery is handled first so its exact prepared bytes remain authoritative.
+Use `status` to find each failed job's `retry_command`. `retry <job_id>` preserves the single-job workflow. `retry --all-eligible` selects only retryable failed jobs in stable creation order, reuses their durable queue or saved-input records without requiring new capture input, and prints a concise selected/completed/failed report. Pass `--youtube-fixture <path>` to either retry form for fixture-backed YouTube work; all-eligible retry reacquires a failed video by its durable video ID without listing the playlist, and pending acknowledgement cleanup uses the same client. Completed, active, and non-retryable jobs are left unchanged. If no eligible jobs exist, the command succeeds without creating a batch or Git commit. A pending source-ready recovery is handled first so its exact prepared bytes remain authoritative, and a failed recovery returns a nonzero exit status.
 
 Article and YouTube adapters share one intake contract. Discovery canonicalizes and deduplicates work, claims it in SQLite, persists queue or playlist finalization intent, and returns a typed raw payload or structured failure. Discovery and acquisition do not edit the tracked article queue, delete saved HTML, or acknowledge YouTube. YouTube acknowledgement clients report either `removed` or `already_absent`, so a retry after a crash remains safe.
 

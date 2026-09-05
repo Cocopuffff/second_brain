@@ -9,7 +9,7 @@ from pathlib import Path
 from .batch import BatchError, BatchRunner
 from .config import CONFIG_SETTINGS, Config, SettingKind
 from .git_ops import GitError, GitRepository
-from .models import PublicationPhase, UNCOMMITTED_PUBLICATION_PHASES
+from .models import PublicationPhase, RetryReport, UNCOMMITTED_PUBLICATION_PHASES
 from .state import StateStore
 from .synthesis import build_controlled_synthesis
 from .youtube import FixtureYouTubeClient
@@ -83,6 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     retry = sub.add_parser("retry", help="retry one durable failed job or all eligible failed jobs")
     retry.add_argument("job_id", nargs="?")
     retry.add_argument("--all-eligible", "--all", dest="all_eligible", action="store_true", help="retry every currently eligible failed job")
+    retry.add_argument("--youtube-fixture")
     batch = sub.add_parser("batch", help="run one finite ingestion batch")
     batch.add_argument("--youtube-fixture")
     return parser
@@ -122,10 +123,15 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("retry accepts a job ID or --all-eligible, not both")
             if not args.all_eligible and not args.job_id:
                 raise ValueError("retry requires a job ID or --all-eligible")
-            report = runner.run(retry_job_id=args.job_id, retry_all=args.all_eligible)
+            if args.youtube_fixture:
+                runner.youtube_client = FixtureYouTubeClient(Path(args.youtube_fixture))
+            result = runner.run(retry_job_id=args.job_id, retry_all=args.all_eligible)
             selected_job_ids: list[str] = []
             if args.all_eligible:
-                selected_job_ids = list(getattr(report, "selected_job_ids", ()))
+                if not isinstance(result, RetryReport):
+                    raise BatchError("all-eligible retry returned an invalid report")
+                selected_job_ids = list(result.selected_job_ids)
+                report = result.report
                 print(
                     json.dumps(
                         {
@@ -144,14 +150,21 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
             else:
+                if isinstance(result, RetryReport):
+                    raise BatchError("single-job retry returned an invalid report")
+                report = result
                 print(json.dumps(report.__dict__, ensure_ascii=False))
             if args.all_eligible:
-                return 2 if report.recovery_block_reason else (0 if report.committed or not selected_job_ids else 1)
+                empty_success = not selected_job_ids and report.claimed == 0 and report.failed == 0
+                return 2 if report.recovery_block_reason else (0 if report.committed or empty_success else 1)
             return 2 if report.recovery_block_reason else (0 if report.committed else 1)
         if args.command == "batch":
             if args.youtube_fixture:
                 runner.youtube_client = FixtureYouTubeClient(Path(args.youtube_fixture))
-            report = runner.run()
+            result = runner.run()
+            if isinstance(result, RetryReport):
+                raise BatchError("batch returned an invalid retry report")
+            report = result
             print(json.dumps(report.__dict__, ensure_ascii=False))
             return 2 if report.recovery_block_reason else (0 if report.committed or report.claimed == 0 else 1)
     except (BatchError, ValueError) as exc:

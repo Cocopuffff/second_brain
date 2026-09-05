@@ -7,7 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .batch import BatchError, BatchRunner
-from .config import Config
+from .config import CONFIG_SETTINGS, Config, SettingKind
 from .git_ops import GitError, GitRepository
 from .models import PublicationPhase, UNCOMMITTED_PUBLICATION_PHASES
 from .state import StateStore
@@ -16,7 +16,15 @@ from .youtube import FixtureYouTubeClient
 
 
 def _config(args) -> Config:
-    return Config.load(Path(args.vault), Path(args.state_dir) if args.state_dir else None, Path(args.config) if args.config else None)
+    cli_values = {
+        setting.name: getattr(args, setting.name)
+        for setting in CONFIG_SETTINGS
+        if getattr(args, setting.name, None) is not None
+    }
+    return Config.load(
+        config_path=Path(args.config) if args.config else None,
+        cli_values=cli_values,
+    )
 
 
 def _runner(config: Config) -> BatchRunner:
@@ -47,9 +55,19 @@ def _publication_statuses(config: Config, state: StateStore) -> list[dict]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="second-brain", description="Batch ingestion for an Obsidian second brain vault")
-    parser.add_argument("--vault", default=".")
-    parser.add_argument("--state-dir")
     parser.add_argument("--config")
+    for setting in CONFIG_SETTINGS:
+        if setting.kind is SettingKind.INTEGER:
+            parser.add_argument(setting.cli_option, dest=setting.name, type=int)
+        elif setting.kind is SettingKind.BOOLEAN:
+            parser.add_argument(
+                setting.cli_option,
+                dest=setting.name,
+                action=argparse.BooleanOptionalAction,
+                default=None,
+            )
+        else:
+            parser.add_argument(setting.cli_option, dest=setting.name)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init", help="create expected vault directories and local state")
     sub.add_parser("preflight", help="validate configuration without consuming inputs")
@@ -63,20 +81,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    config = _config(args)
     try:
+        args = build_parser().parse_args(argv)
+        config = _config(args)
+        if args.command == "preflight":
+            errors = config.validate()
+            print(json.dumps({"ok": not errors, "errors": errors}))
+            return 0 if not errors else 2
+        if args.command != "init":
+            errors = config.validate()
+            if errors:
+                raise BatchError("preflight failed: " + "; ".join(errors))
         runner = _runner(config)
         if args.command == "init":
             runner.initialize()
             print(json.dumps({"initialized": True, "vault": str(config.vault), "state_dir": str(config.state_dir)}))
             return 0
-        if args.command == "preflight":
-            errors = config.validate()
-            print(json.dumps({"ok": not errors, "errors": errors}))
-            return 0 if not errors else 2
         if args.command == "dry-run":
-            print(json.dumps(runner.dry_run(), ensure_ascii=False))
+            preview = runner.dry_run()
+            print(json.dumps(preview, ensure_ascii=False))
             return 0
         if args.command == "status":
             state = StateStore(config.database)

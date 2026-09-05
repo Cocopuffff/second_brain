@@ -17,6 +17,17 @@ class YouTubeAcknowledgement(StrEnum):
     ALREADY_ABSENT = "already_absent"
 
 
+class YouTubePlaylistKind(StrEnum):
+    FIXTURE = "fixture"
+    PRODUCTION = "production"
+
+
+@dataclass(frozen=True)
+class YouTubePlaylistReference:
+    kind: YouTubePlaylistKind
+    value: str
+
+
 @dataclass(frozen=True)
 class YouTubePlaylistItem:
     video_id: str
@@ -24,7 +35,7 @@ class YouTubePlaylistItem:
 
 
 class YouTubeClient(Protocol):
-    def list_playlist(self, playlist: str) -> list[YouTubePlaylistItem]: ...
+    def list_playlist(self, playlist: YouTubePlaylistReference) -> list[YouTubePlaylistItem]: ...
     def acquire_video(self, video_id: str) -> VideoInput: ...
     def acknowledge(self, playlist_item_id: str) -> YouTubeAcknowledgement: ...
 
@@ -41,9 +52,11 @@ class FixtureYouTubeClient:
         self._removed: set[str] = set()
         self._discovered: dict[str, dict] = {}
 
-    def list_playlist(self, playlist: str) -> list[YouTubePlaylistItem]:
+    def list_playlist(self, playlist: YouTubePlaylistReference) -> list[YouTubePlaylistItem]:
+        if playlist.kind is not YouTubePlaylistKind.FIXTURE:
+            raise TranscriptError("fixture YouTube client requires a fixture playlist reference")
         data = json.loads(self.fixture.read_text(encoding="utf-8"))
-        items = data.get(playlist, data if isinstance(data, list) else [])
+        items = data.get(playlist.value, data if isinstance(data, list) else [])
         self._discovered.update((str(item["video_id"]), item) for item in items)
         return [
             YouTubePlaylistItem(

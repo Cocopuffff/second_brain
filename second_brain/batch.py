@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -23,6 +24,37 @@ from .youtube import YouTubeClient
 
 class BatchError(RuntimeError):
     pass
+
+
+class _LimitedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, max_redirects: int):
+        super().__init__()
+        self.redirect_limit = max_redirects
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        followed = getattr(req, "_second_brain_redirects", 0)
+        if followed >= self.redirect_limit:
+            raise urllib.error.HTTPError(
+                req.full_url,
+                code,
+                "HTTP redirect exceeds the configured limit",
+                headers,
+                fp,
+            )
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None:
+            setattr(redirected, "_second_brain_redirects", followed + 1)
+        return redirected
+
+
+def _limited_redirect_handler(max_redirects: int) -> urllib.request.HTTPRedirectHandler:
+    redirect_cap = max(1, max_redirects)
+
+    class _ConfiguredLimitedRedirectHandler(_LimitedRedirectHandler):
+        max_redirections = redirect_cap
+        max_repeats = redirect_cap
+
+    return _ConfiguredLimitedRedirectHandler(max_redirects)
 
 
 @dataclass
@@ -78,6 +110,9 @@ class BatchRunner:
         StateStore(self.config.database).close()
 
     def dry_run(self) -> dict:
+        config_errors = self.config.validate()
+        if config_errors:
+            return {"queue_urls": 0, "html_files": 0, "errors": config_errors}
         queue = self._queue_path()
         inputs, queue_errors = self._read_queue_preview(queue)
         html_files, html_errors = discover_html(self.config.to_ingest)
@@ -323,16 +358,24 @@ class BatchRunner:
                     continue
         return allowed
 
-    @staticmethod
-    def _fetch(url: str) -> str:
+    def _fetch(self, url: str) -> str:
         req = urllib.request.Request(url, headers={"User-Agent": "second-brain-ingestion/0.1 (+local batch)", "Accept": "text/html,application/xhtml+xml"})
-        with urllib.request.urlopen(req, timeout=30) as response:
-            if int(response.headers.get("Content-Length", "0") or "0") > 10_000_000:
+        opener = urllib.request.build_opener(_limited_redirect_handler(self.config.max_redirects))
+        with opener.open(req, timeout=self.config.request_timeout) as response:
+            content_length = response.headers.get("Content-Length", "0") or "0"
+            try:
+                declared_size = int(content_length)
+            except ValueError as exc:
+                raise BatchError("HTTP response has an invalid size header") from exc
+            if declared_size > self.config.max_response_bytes:
                 raise BatchError("HTTP response exceeds the configured size limit")
             content_type = response.headers.get_content_type()
             if content_type not in {"text/html", "application/xhtml+xml"}:
                 raise BatchError(f"unsupported HTTP content type: {content_type}")
-            return response.read(10_000_001).decode("utf-8", errors="strict")
+            body = response.read(self.config.max_response_bytes + 1)
+            if len(body) > self.config.max_response_bytes:
+                raise BatchError("HTTP response exceeds the configured size limit")
+            return body.decode("utf-8", errors="strict")
 
     @staticmethod
     def _read_queue_preview(path: Path):

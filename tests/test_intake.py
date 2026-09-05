@@ -17,8 +17,11 @@ from second_brain.models import AcquiredArticle, AcquiredYouTube, TranscriptSegm
 from second_brain.state import StateStore
 from second_brain.youtube import (
     FixtureYouTubeClient,
+    TranscriptError,
     YouTubeAcknowledgement,
+    YouTubePlaylistKind,
     YouTubePlaylistItem,
+    YouTubePlaylistReference,
 )
 from second_brain.publication import PublicationCrash
 
@@ -43,6 +46,17 @@ def _fixture(tmp_path: Path) -> tuple[Path, Config, FixtureYouTubeClient]:
         encoding="utf-8",
     )
     return vault, config, FixtureYouTubeClient(youtube_fixture)
+
+
+def test_fixture_youtube_client_rejects_production_playlist_reference(tmp_path: Path):
+    fixture = tmp_path / "youtube.json"
+    fixture.write_text("{}", encoding="utf-8")
+    client = FixtureYouTubeClient(fixture)
+
+    with pytest.raises(TranscriptError, match="fixture playlist reference"):
+        client.list_playlist(
+            YouTubePlaylistReference(YouTubePlaylistKind.PRODUCTION, "production-playlist-id")
+        )
 
 
 def test_article_and_youtube_share_one_normalized_intake_contract(tmp_path: Path):
@@ -89,7 +103,8 @@ class _ClaimAwareYouTubeClient:
         self.state = state
         self.acquired: list[str] = []
 
-    def list_playlist(self, playlist: str) -> list[YouTubePlaylistItem]:
+    def list_playlist(self, playlist: YouTubePlaylistReference) -> list[YouTubePlaylistItem]:
+        assert playlist == YouTubePlaylistReference(YouTubePlaylistKind.FIXTURE, "To Ingest")
         return [
             YouTubePlaylistItem(
                 video_id="abcDEF12345",

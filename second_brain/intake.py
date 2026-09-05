@@ -12,7 +12,7 @@ from .html_discovery import discover_html, html_hash
 from .models import AcquiredArticle, AcquiredYouTube, Job, PublicationIntent, SourceKind
 from .queue import read_article_queue
 from .state import StateStore
-from .youtube import YouTubeClient
+from .youtube import YouTubeClient, YouTubePlaylistKind, YouTubePlaylistReference
 
 
 AcquiredPayload = AcquiredArticle | AcquiredYouTube
@@ -174,7 +174,7 @@ class ArticleIntakeAdapter:
 
 
 class YouTubeIntakeAdapter:
-    def __init__(self, playlist: str, client: YouTubeClient):
+    def __init__(self, playlist: YouTubePlaylistReference, client: YouTubeClient):
         self.playlist = playlist
         self.client = client
 
@@ -315,7 +315,19 @@ def build_source_intake(
 ) -> SourceIntake:
     adapters: list[IntakeAdapter] = [ArticleIntakeAdapter(config, fetcher)]
     if youtube_client is not None:
-        adapters.append(YouTubeIntakeAdapter(config.youtube_playlist, youtube_client))
+        if config.youtube_enabled:
+            if not config.youtube_playlist_id:
+                raise ValueError("youtube_playlist_id is required when YouTube is enabled")
+            playlist = YouTubePlaylistReference(
+                YouTubePlaylistKind.PRODUCTION,
+                config.youtube_playlist_id,
+            )
+        else:
+            playlist = YouTubePlaylistReference(
+                YouTubePlaylistKind.FIXTURE,
+                config.youtube_playlist,
+            )
+        adapters.append(YouTubeIntakeAdapter(playlist, youtube_client))
     return SourceIntake(config, state, tuple(adapters))
 
 
@@ -340,6 +352,8 @@ __all__ = [
     "SourceIntake",
     "WorkDescriptor",
     "YouTubeIntakeAdapter",
+    "YouTubePlaylistKind",
+    "YouTubePlaylistReference",
     "YouTubeWorkDescriptor",
     "build_source_intake",
     "queue_path_for",

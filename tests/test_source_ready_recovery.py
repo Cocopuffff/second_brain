@@ -8,7 +8,7 @@ from second_brain.config import Config
 from second_brain.models import ChangeSet, VideoInput
 from second_brain.synthesis import ExecutorIdentity, FailureCategory, SynthesisFailure, SynthesisMetadata, SynthesisOutcome
 from second_brain.state import StateStore
-from second_brain.youtube import FixtureYouTubeClient, YouTubePlaylistItem
+from second_brain.youtube import FixtureYouTubeClient, YouTubePlaylistItem, YouTubePlaylistReference
 
 
 def _git_repo(path: Path) -> None:
@@ -94,7 +94,7 @@ class _NoDiscoveryClient:
         self.calls = 0
         self.acknowledged: list[str] = []
 
-    def list_playlist(self, playlist: str) -> list[YouTubePlaylistItem]:
+    def list_playlist(self, playlist: YouTubePlaylistReference) -> list[YouTubePlaylistItem]:
         self.calls += 1
         raise AssertionError("source-ready retry rediscovered YouTube input")
 
